@@ -1,19 +1,19 @@
 {
   imports = [
+    ./crowdsec
+    ./elasticsearch
+    ./haproxy
+    ./home-assistant
+    ./mariadb
+    ./minio
     ./mongodb
     ./mongodb-pod
-    ./postgresql
-    ./mariadb
-    ./redis
-    ./opensearch
-    ./elasticsearch
-    ./minio
-    ./nginx
-    ./haproxy
-    ./nextcloud
-    ./home-assistant
     ./n8n
     ./n8n-pod
-    ./crowdsec
+    ./nextcloud
+    ./nginx
+    ./opensearch
+    ./postgresql
+    ./redis
   ];
 }
