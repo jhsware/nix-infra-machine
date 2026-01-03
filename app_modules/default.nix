@@ -9,6 +9,7 @@
     ./elasticsearch
     ./minio
     ./nginx
+    ./haproxy
     ./nextcloud
     ./home-assistant
     ./n8n
