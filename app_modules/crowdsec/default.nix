@@ -1,10 +1,11 @@
 { config, pkgs, lib, options, ... }:
+
 let
   appName = "crowdsec";
   cfg = config.infrastructure.${appName};
 
   # ==========================================================================
-  # Version Detection
+  # Version Detection (must not depend on cfg to avoid recursion)
   # ==========================================================================
   # Check if the native services.crowdsec module exists (NixOS 25.11+)
   hasNativeCrowdsecModule = options ? services && options.services ? crowdsec;
@@ -20,377 +21,11 @@ let
   # Users can override with implementation = "native" to test.
   nativeModuleIsStable = false;
 
-  # Determine which implementation to use
-  useNativeImplementation = 
-    if cfg.implementation == "native" then true
-    else if cfg.implementation == "custom" then false
-    else if cfg.implementation == "auto" then 
-      hasNativeCrowdsecModule && nativeModuleIsStable
-    else false;
-
-  # Helper to generate YAML format
-  yaml = (pkgs.formats.yaml {}).generate;
-
   # State directory for CrowdSec
   stateDir = "/var/lib/crowdsec";
 
-  # ==========================================================================
-  # Build acquisitions list based on enabled features
-  # ==========================================================================
-  acquisitions = lib.flatten [
-    # SSH acquisition (journalctl-based)
-    (lib.optional cfg.features.sshProtection {
-      source = "journalctl";
-      journalctl_filter = [ "_SYSTEMD_UNIT=sshd.service" ];
-      labels.type = "syslog";
-    })
-    # Nginx acquisition (log file-based)
-    (lib.optional cfg.features.nginxProtection {
-      filenames = cfg.features.nginxLogPaths;
-      labels.type = "nginx";
-    })
-    # System/kernel logs acquisition
-    (lib.optional cfg.features.systemProtection {
-      source = "journalctl";
-      journalctl_filter = [ "_TRANSPORT=kernel" ];
-      labels.type = "syslog";
-    })
-    # Custom acquisitions from user
-    cfg.acquisitions
-  ];
-
-  # ==========================================================================
-  # Build hub collections list based on enabled features
-  # ==========================================================================
-  hubCollections = lib.flatten [
-    (lib.optional cfg.features.sshProtection "crowdsecurity/sshd")
-    (lib.optional cfg.features.nginxProtection "crowdsecurity/nginx")
-    (lib.optional cfg.features.systemProtection "crowdsecurity/linux")
-    cfg.hub.collections
-  ];
-
-  # ==========================================================================
-  # Custom Implementation: Configuration Files
-  # ==========================================================================
-  
-  # Generate acquisitions file as multi-document YAML
-  # CrowdSec expects each acquisition as a separate YAML document (separated by ---)
-  # NOT as a YAML list/array
-  #
-  # We use a recursive YAML formatter to handle nested attributes properly
-  acquisitionsFile = let
-    # Recursively format a value to YAML with proper indentation
-    formatYamlValue = indent: value:
-      if builtins.isList value then
-        lib.concatMapStringsSep "\n" (item: 
-          "${indent}- ${
-            if builtins.isAttrs item then
-              "\n" + formatYamlAttrs (indent + "  ") item
-            else if builtins.isList item then
-              formatYamlValue (indent + "  ") item
-            else
-              toString item
-          }"
-        ) value
-      else if builtins.isAttrs value then
-        formatYamlAttrs indent value
-      else if builtins.isString value then
-        # Quote strings that might need it
-        if lib.hasInfix " " value || lib.hasInfix ":" value || lib.hasInfix "#" value then
-          "\"${value}\""
-        else
-          value
-      else
-        toString value;
-    
-    # Format an attrset to YAML
-    formatYamlAttrs = indent: attrs:
-      lib.concatStringsSep "\n" (lib.mapAttrsToList (name: value:
-        if builtins.isAttrs value then
-          "${indent}${name}:\n${formatYamlAttrs (indent + "  ") value}"
-        else if builtins.isList value then
-          "${indent}${name}:\n${formatYamlValue (indent + "  ") value}"
-        else
-          "${indent}${name}: ${formatYamlValue "" value}"
-      ) attrs);
-    
-    # Format a single acquisition document
-    formatAcquisition = acq: formatYamlAttrs "" acq;
-  in
-    pkgs.writeText "acquisitions.yaml" (
-      lib.concatMapStringsSep "\n---\n" formatAcquisition acquisitions
-    );
-
-  # Generate simulation file (CrowdSec requires this)
-  simulationFile = yaml "simulation.yaml" {
-    simulation = false;
-    exclusions = [];
-  };
-
-
-  # Generate main config file (compatible with CrowdSec 1.7.x)
-  configFile = yaml "config.yaml" {
-    common = {
-      daemonize = false;
-      log_media = "stdout";
-      log_level = cfg.logLevel;
-    };
-    config_paths = {
-      config_dir = "${stateDir}/config";
-      data_dir = "${stateDir}/data";
-      hub_dir = "${stateDir}/hub";
-      simulation_path = "${stateDir}/config/simulation.yaml";
-    };
-    crowdsec_service = {
-      acquisition_path = "${stateDir}/config/acquisitions.yaml";
-      parser_routines = 1;
-    };
-    cscli = {
-      output = "human";
-    };
-    api = {
-      client = {
-        insecure_skip_verify = false;
-        credentials_path = "${stateDir}/config/local_api_credentials.yaml";
-      };
-      server = {
-        enable = true;
-        listen_uri = "${cfg.api.listenAddr}:${toString cfg.api.listenPort}";
-        profiles_path = "${stateDir}/config/profiles.yaml";
-        online_client = {
-          credentials_path = "${stateDir}/config/online_api_credentials.yaml";
-        };
-      };
-    };
-    db_config = {
-      type = "sqlite";
-      db_path = "${stateDir}/data/crowdsec.db";
-      use_wal = true;
-    };
-  };
-
-  # Generate profiles file (CrowdSec expects multi-document YAML format)
-  # NOTE: pkgs.formats.yaml generates a list, but CrowdSec expects YAML documents
-  # So we write the profile as a proper YAML document
-  profilesFile = pkgs.writeText "profiles.yaml" ''
-    name: default_ip_remediation
-    filters:
-      - Alert.Remediation == true && Alert.GetScope() == "Ip"
-    decisions:
-      - type: ban
-        duration: ${cfg.bouncer.banDuration}
-    on_success: break
-  '';
-
-  # Initialization script - sets up CrowdSec on first run
-  initScript = pkgs.writeShellScript "crowdsec-init" ''
-    set -e
-    export PATH="${lib.makeBinPath [ cfg.package pkgs.coreutils pkgs.gnugrep pkgs.nettools pkgs.findutils ]}:$PATH"
-    
-    STATE_DIR="${stateDir}"
-    CONFIG_DIR="$STATE_DIR/config"
-    DATA_DIR="$STATE_DIR/data"
-    HUB_DIR="$STATE_DIR/hub"
-    PACKAGE="${cfg.package}"
-    
-    # Create directories
-    mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$HUB_DIR"
-    
-    # Copy configuration files
-    cp -f ${configFile} "$CONFIG_DIR/config.yaml"
-    cp -f ${profilesFile} "$CONFIG_DIR/profiles.yaml"
-    cp -f ${acquisitionsFile} "$CONFIG_DIR/acquisitions.yaml"
-    cp -f ${simulationFile} "$CONFIG_DIR/simulation.yaml"
-    
-    # Debug: Show acquisitions file content
-    echo "Generated acquisitions.yaml:"
-    cat "$CONFIG_DIR/acquisitions.yaml"
-    echo ""
-    
-    # Copy patterns directory from package (required for parser grok patterns)
-    # The patterns are typically in share/crowdsec/config/patterns
-    echo "Looking for patterns directory..."
-    
-    # Try common locations
-    PATTERNS_FOUND=0
-    for PATTERNS_PATH in \
-      "$PACKAGE/share/crowdsec/config/patterns" \
-      "$PACKAGE/share/crowdsec/patterns" \
-      "$PACKAGE/etc/crowdsec/patterns" \
-      ; do
-      if [ -d "$PATTERNS_PATH" ]; then
-        echo "Found patterns at: $PATTERNS_PATH"
-        rm -rf "$CONFIG_DIR/patterns"
-        cp -r "$PATTERNS_PATH" "$CONFIG_DIR/patterns"
-        PATTERNS_FOUND=1
-        break
-      fi
-    done
-    
-    # If not found in common locations, search the entire package
-    if [ "$PATTERNS_FOUND" = "0" ]; then
-      echo "Searching for patterns directory in package..."
-      PATTERNS_PATH=$(find "$PACKAGE" -type d -name "patterns" 2>/dev/null | head -1)
-      if [ -n "$PATTERNS_PATH" ]; then
-        echo "Found patterns at: $PATTERNS_PATH"
-        rm -rf "$CONFIG_DIR/patterns"
-        cp -r "$PATTERNS_PATH" "$CONFIG_DIR/patterns"
-        PATTERNS_FOUND=1
-      fi
-    fi
-    
-    if [ "$PATTERNS_FOUND" = "0" ]; then
-      echo "WARNING: Could not find patterns directory!"
-      echo "Package contents:"
-      ls -la "$PACKAGE/" || true
-      ls -la "$PACKAGE/share/" || true
-      ls -la "$PACKAGE/share/crowdsec/" 2>/dev/null || true
-    fi
-    
-    # Initialize database if it doesn't exist
-    if [ ! -f "$DATA_DIR/crowdsec.db" ]; then
-      echo "Initializing CrowdSec database..."
-      touch "$CONFIG_DIR/local_api_credentials.yaml"
-      touch "$CONFIG_DIR/online_api_credentials.yaml"
-      chmod 640 "$CONFIG_DIR/local_api_credentials.yaml"
-      chmod 640 "$CONFIG_DIR/online_api_credentials.yaml"
-    fi
-    
-    # Generate machine ID if it doesn't exist
-    if [ ! -f "$CONFIG_DIR/local_api_credentials.yaml" ] || [ ! -s "$CONFIG_DIR/local_api_credentials.yaml" ]; then
-      echo "Registering local machine..."
-      cscli -c "$CONFIG_DIR/config.yaml" machines add "$(hostname)" --auto --force || true
-    fi
-    
-    # Update hub index
-    echo "Updating hub index..."
-    cscli -c "$CONFIG_DIR/config.yaml" hub update || true
-    
-    # Set correct ownership
-    chown -R crowdsec:crowdsec "$STATE_DIR"
-  '';
-
-
-
-  # Hub installation script (runs after service is started)
-  hubInstallScript = pkgs.writeShellScript "crowdsec-hub-install" ''
-    set -e
-    export PATH="${lib.makeBinPath [ cfg.package pkgs.coreutils pkgs.gnugrep ]}:$PATH"
-    
-    CONFIG_DIR="${stateDir}/config"
-    
-    # Wait for API to be ready
-    for i in $(seq 1 30); do
-      if cscli -c "$CONFIG_DIR/config.yaml" hub list >/dev/null 2>&1; then
-        break
-      fi
-      sleep 1
-    done
-    
-    # Install collections
-    ${lib.concatMapStringsSep "\n" (c: ''
-      if ! cscli -c "$CONFIG_DIR/config.yaml" collections list 2>/dev/null | grep -q "${c}"; then
-        cscli -c "$CONFIG_DIR/config.yaml" collections install ${c} || true
-      fi
-    '') hubCollections}
-    
-    # Install additional scenarios
-    ${lib.concatMapStringsSep "\n" (s: ''
-      if ! cscli -c "$CONFIG_DIR/config.yaml" scenarios list 2>/dev/null | grep -q "${s}"; then
-        cscli -c "$CONFIG_DIR/config.yaml" scenarios install ${s} || true
-      fi
-    '') cfg.hub.scenarios}
-    
-    # Install additional parsers
-    ${lib.concatMapStringsSep "\n" (p: ''
-      if ! cscli -c "$CONFIG_DIR/config.yaml" parsers list 2>/dev/null | grep -q "${p}"; then
-        cscli -c "$CONFIG_DIR/config.yaml" parsers install ${p} || true
-      fi
-    '') cfg.hub.parsers}
-  '';
-
-  # ==========================================================================
-  # Firewall Bouncer Configuration (shared between implementations)
-  # ==========================================================================
-  bouncerEnabled = cfg.features.firewallBouncer && cfg.bouncer.package != null;
-  
-  # Whether to use declarative nftables integration
-  useNftablesIntegration = bouncerEnabled && cfg.bouncer.mode == "nftables" && cfg.bouncer.nftablesIntegration;
-
-  # Bouncer config - uses set-only mode when nftablesIntegration is enabled
-  # This means the bouncer only manages set membership, not table/chain creation
-  bouncerConfigFile = lib.mkIf bouncerEnabled (yaml "crowdsec-firewall-bouncer.yaml" ({
-    mode = cfg.bouncer.mode;
-    update_frequency = "10s";
-    api_url = "http://${cfg.api.listenAddr}:${toString cfg.api.listenPort}/";
-    api_key = "\${BOUNCER_API_KEY}";
-    disable_ipv6 = false;
-    deny_action = cfg.bouncer.denyAction;
-    deny_log = cfg.bouncer.denyLog;
-    deny_log_prefix = cfg.bouncer.denyLogPrefix;
-  } // lib.optionalAttrs (cfg.bouncer.mode == "nftables") {
-    nftables = {
-      ipv4 = {
-        enabled = true;
-        # set-only mode: bouncer only manages set membership, not table structure
-        # When true, tables/chains must be created declaratively (by NixOS)
-        set-only = useNftablesIntegration;
-        table = "crowdsec";
-        chain = "crowdsec-chain";
-        set = "crowdsec-blocklist";
-      };
-      ipv6 = {
-        enabled = true;
-        set-only = useNftablesIntegration;
-        table = "crowdsec6";
-        chain = "crowdsec6-chain";
-        set = "crowdsec6-blocklist";
-      };
-    };
-  } // lib.optionalAttrs (cfg.bouncer.mode == "iptables") {
-    iptables_chains = [ "INPUT" "FORWARD" ];
-  } // lib.optionalAttrs (cfg.bouncer.mode == "ipset") {
-    ipset_type = "nethash";
-    ipset = "crowdsec-blocklist";
-    ipset6 = "crowdsec6-blocklist";
-  }));
-
-
-  bouncerRegisterScript = lib.mkIf bouncerEnabled (pkgs.writeShellScript "crowdsec-bouncer-register" ''
-    set -e
-    export PATH="${lib.makeBinPath [ cfg.package pkgs.coreutils pkgs.gnugrep pkgs.gnused ]}:$PATH"
-    
-    CONFIG_DIR="${stateDir}/config"
-    KEY_FILE="/var/lib/crowdsec-firewall-bouncer/api_key"
-    
-    # Wait for CrowdSec API to be ready
-    for i in $(seq 1 60); do
-      if cscli -c "$CONFIG_DIR/config.yaml" bouncers list >/dev/null 2>&1; then
-        break
-      fi
-      sleep 1
-    done
-    
-    # Check if bouncer already registered
-    if ! cscli -c "$CONFIG_DIR/config.yaml" bouncers list 2>/dev/null | grep -q "firewall-bouncer"; then
-      # Register new bouncer and save key
-      KEY=$(cscli -c "$CONFIG_DIR/config.yaml" bouncers add firewall-bouncer -o raw 2>/dev/null || echo "")
-      if [ -n "$KEY" ]; then
-        echo "$KEY" > "$KEY_FILE"
-        chmod 600 "$KEY_FILE"
-      fi
-    fi
-    
-    # Read existing key if registration failed
-    if [ -f "$KEY_FILE" ]; then
-      export BOUNCER_API_KEY=$(cat "$KEY_FILE")
-    fi
-    
-    # Generate config with key substituted
-    if [ -n "$BOUNCER_API_KEY" ]; then
-      sed "s/\''${BOUNCER_API_KEY}/$BOUNCER_API_KEY/g" ${bouncerConfigFile} > /var/lib/crowdsec-firewall-bouncer/config.yaml
-    fi
-  '');
+  # Helper to generate YAML format
+  yamlFormat = pkgs.formats.yaml {};
 
 in
 {
@@ -857,275 +492,575 @@ in
   # ==========================================================================
   # Configuration
   # ==========================================================================
-  config = lib.mkIf cfg.enable (lib.mkMerge [
-    # ==========================================================================
-    # Common Configuration (both implementations)
-    # ==========================================================================
-    {
-      # Assertions
-      assertions = [
-        {
-          assertion = !cfg.features.firewallBouncer || cfg.bouncer.package != null;
-          message = ''
-            CrowdSec firewall bouncer is enabled but no package is configured.
-            
-            The bouncer package should be available as pkgs.crowdsec-firewall-bouncer
-            on NixOS 25.11+. If using an older NixOS version, you may need to:
-            
-            1. Upgrade to NixOS 25.11+
-            2. Set infrastructure.crowdsec.features.firewallBouncer = false
-            3. Provide the package from an external source
-          '';
-        }
+  config = lib.mkIf cfg.enable (
+    let
+      # ========================================================================
+      # All cfg-dependent values MUST be defined inside this let block
+      # to avoid infinite recursion during module evaluation
+      # ========================================================================
 
-        {
-          assertion = acquisitions != [];
-          message = ''
-            CrowdSec requires at least one acquisition source.
-            
-            Enable at least one of:
-            - infrastructure.crowdsec.features.sshProtection = true
-            - infrastructure.crowdsec.features.nginxProtection = true
-            - infrastructure.crowdsec.features.systemProtection = true
-            
-            Or add custom acquisitions via infrastructure.crowdsec.acquisitions
-          '';
-        }
-        {
-          assertion = cfg.implementation != "native" || hasNativeCrowdsecModule;
-          message = ''
-            CrowdSec native implementation requires NixOS 25.11 or later.
-            
-            Either:
-            1. Upgrade to NixOS 25.11+
-            2. Set infrastructure.crowdsec.implementation = "custom"
-            3. Set infrastructure.crowdsec.implementation = "auto" (recommended)
-          '';
-        }
+      # Determine which implementation to use
+      useNativeImplementation = 
+        if cfg.implementation == "native" then true
+        else if cfg.implementation == "custom" then false
+        else if cfg.implementation == "auto" then 
+          hasNativeCrowdsecModule && nativeModuleIsStable
+        else false;
+
+      # Build acquisitions list based on enabled features
+      acquisitions = lib.flatten [
+        # SSH acquisition (journalctl-based)
+        (lib.optional cfg.features.sshProtection {
+          source = "journalctl";
+          journalctl_filter = [ "_SYSTEMD_UNIT=sshd.service" ];
+          labels.type = "syslog";
+        })
+        # Nginx acquisition (log file-based)
+        (lib.optional cfg.features.nginxProtection {
+          filenames = cfg.features.nginxLogPaths;
+          labels.type = "nginx";
+        })
+        # System/kernel logs acquisition
+        (lib.optional cfg.features.systemProtection {
+          source = "journalctl";
+          journalctl_filter = [ "_TRANSPORT=kernel" ];
+          labels.type = "syslog";
+        })
+        # Custom acquisitions from user
+        cfg.acquisitions
       ];
 
-      # Open firewall for LAPI if configured
-      networking.firewall.allowedTCPPorts = 
-        lib.mkIf cfg.api.openFirewall [ cfg.api.listenPort ];
-
-      # Install useful CLI tools
-      environment.systemPackages = [ 
-        cfg.package  # Includes cscli
-      ] ++ lib.optionals (bouncerEnabled && cfg.bouncer.mode == "nftables") [
-        pkgs.nftables
-      ] ++ lib.optionals (bouncerEnabled && cfg.bouncer.mode == "iptables") [
-        pkgs.iptables
-      ] ++ lib.optionals (bouncerEnabled && cfg.bouncer.mode == "ipset") [
-        pkgs.ipset
+      # Build hub collections list based on enabled features
+      hubCollections = lib.flatten [
+        (lib.optional cfg.features.sshProtection "crowdsecurity/sshd")
+        (lib.optional cfg.features.nginxProtection "crowdsecurity/nginx")
+        (lib.optional cfg.features.systemProtection "crowdsecurity/linux")
+        cfg.hub.collections
       ];
-    }
 
-    # ==========================================================================
-    # Declarative nftables Integration
-    # 
-    # When nftablesIntegration is enabled, we create the CrowdSec tables and
-    # sets declaratively. This ensures they survive NixOS rebuilds and don't
-    # conflict with the NixOS firewall.
-    #
-    # The bouncer runs in "set-only" mode and only manages set membership,
-    # not table/chain creation or destruction.
-    # ==========================================================================
-    (lib.mkIf useNftablesIntegration {
-      # Enable nftables
-      networking.nftables.enable = true;
+      # ========================================================================
+      # Custom Implementation: Configuration Files
+      # ========================================================================
       
-      # Add CrowdSec tables to nftables configuration
-      # These tables are separate from the main firewall table and won't be
-      # affected by NixOS firewall rebuilds
-      networking.nftables.tables = {
-        # IPv4 CrowdSec table
-        crowdsec = {
-          family = "ip";
-          content = ''
-            # Set for blocked IPv4 addresses
-            # The bouncer will add/remove IPs with timeout
-            set crowdsec-blocklist {
-              type ipv4_addr
-              flags timeout
-            }
-            
-            # Chain that drops packets from blocked IPs
-            chain crowdsec-chain {
-              type filter hook input priority -1; policy accept;
-              ${lib.optionalString cfg.bouncer.denyLog ''
-              ip saddr @crowdsec-blocklist log prefix "${cfg.bouncer.denyLogPrefix}" 
-              ''}
-              ip saddr @crowdsec-blocklist ${lib.toLower cfg.bouncer.denyAction}
-            }
-          '';
+      # Generate acquisitions file as multi-document YAML
+      # CrowdSec expects each acquisition as a separate YAML document (separated by ---)
+      # We use yamlFormat.generate for each acquisition and concatenate them
+      acquisitionsFile = pkgs.writeText "acquisitions.yaml" (
+        lib.concatMapStringsSep "\n---\n" (acq: 
+          builtins.readFile (yamlFormat.generate "acq.yaml" acq)
+        ) acquisitions
+      );
+
+      # Generate simulation file (CrowdSec requires this)
+      simulationFile = yamlFormat.generate "simulation.yaml" {
+        simulation = false;
+        exclusions = [];
+      };
+
+      # Generate main config file (compatible with CrowdSec 1.7.x)
+      configFile = yamlFormat.generate "config.yaml" {
+        common = {
+          daemonize = false;
+          log_media = "stdout";
+          log_level = cfg.logLevel;
         };
+        config_paths = {
+          config_dir = "${stateDir}/config";
+          data_dir = "${stateDir}/data";
+          hub_dir = "${stateDir}/hub";
+          simulation_path = "${stateDir}/config/simulation.yaml";
+        };
+        crowdsec_service = {
+          acquisition_path = "${stateDir}/config/acquisitions.yaml";
+          parser_routines = 1;
+        };
+        cscli = {
+          output = "human";
+        };
+        api = {
+          client = {
+            insecure_skip_verify = false;
+            credentials_path = "${stateDir}/config/local_api_credentials.yaml";
+          };
+          server = {
+            enable = true;
+            listen_uri = "${cfg.api.listenAddr}:${toString cfg.api.listenPort}";
+            profiles_path = "${stateDir}/config/profiles.yaml";
+            online_client = {
+              credentials_path = "${stateDir}/config/online_api_credentials.yaml";
+            };
+          };
+        };
+        db_config = {
+          type = "sqlite";
+          db_path = "${stateDir}/data/crowdsec.db";
+          use_wal = true;
+        };
+      };
+
+      # Generate profiles file (CrowdSec expects multi-document YAML format)
+      profilesFile = pkgs.writeText "profiles.yaml" ''
+        name: default_ip_remediation
+        filters:
+          - Alert.Remediation == true && Alert.GetScope() == "Ip"
+        decisions:
+          - type: ban
+            duration: ${cfg.bouncer.banDuration}
+        on_success: break
+      '';
+
+      # Initialization script - sets up CrowdSec on first run
+      initScript = pkgs.writeShellScript "crowdsec-init" ''
+        set -e
+        export PATH="${lib.makeBinPath [ cfg.package pkgs.coreutils pkgs.gnugrep pkgs.nettools pkgs.findutils ]}:$PATH"
         
-        # IPv6 CrowdSec table
-        crowdsec6 = {
-          family = "ip6";
-          content = ''
-            # Set for blocked IPv6 addresses
-            set crowdsec6-blocklist {
-              type ipv6_addr
-              flags timeout
-            }
-            
-            # Chain that drops packets from blocked IPs
-            chain crowdsec6-chain {
-              type filter hook input priority -1; policy accept;
-              ${lib.optionalString cfg.bouncer.denyLog ''
-              ip6 saddr @crowdsec6-blocklist log prefix "${cfg.bouncer.denyLogPrefix}" 
-              ''}
-              ip6 saddr @crowdsec6-blocklist ${lib.toLower cfg.bouncer.denyAction}
-            }
-          '';
-        };
-      };
-    })
-
-
-    # ==========================================================================
-    # Custom Implementation
-    # ==========================================================================
-    (lib.mkIf (!useNativeImplementation) {
-      # Create crowdsec user and group
-      users.users.crowdsec = {
-        isSystemUser = true;
-        group = "crowdsec";
-        home = stateDir;
-        description = "CrowdSec daemon user";
-      };
-      users.groups.crowdsec = {};
-
-      # Ensure data directories exist and create config symlink for cscli
-      systemd.tmpfiles.rules = [
-        "d ${stateDir} 0755 crowdsec crowdsec - -"
-        "d ${stateDir}/config 0755 crowdsec crowdsec - -"
-        "d ${stateDir}/data 0755 crowdsec crowdsec - -"
-        "d ${stateDir}/hub 0755 crowdsec crowdsec - -"
-        # Create /etc/crowdsec directory and symlink for cscli default config path
-        "d /etc/crowdsec 0755 root root - -"
-        "L+ /etc/crowdsec/config.yaml - - - - ${stateDir}/config/config.yaml"
-      ] ++ lib.optionals bouncerEnabled [
-        "d /var/lib/crowdsec-firewall-bouncer 0750 root root - -"
-      ];
-
-
-      # Main CrowdSec service
-      systemd.services.crowdsec = {
-        description = "CrowdSec Security Engine";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network.target" "local-fs.target" ];
-
-        serviceConfig = {
-          Type = "simple";
-          User = "crowdsec";
-          Group = "crowdsec";
-          ExecStartPre = [
-            "+${initScript}"  # Run as root for permissions
-          ];
-          ExecStart = "${cfg.package}/bin/crowdsec -c ${stateDir}/config/config.yaml";
-          ExecStartPost = "${hubInstallScript}";
-          Restart = "always";
-          RestartSec = "10s";
-          
-          # Security hardening
-          ProtectSystem = "strict";
-          ProtectHome = true;
-          PrivateTmp = true;
-          NoNewPrivileges = true;
-          ReadWritePaths = [ stateDir ];
-          
-          # Allow journal access for systemd log sources
-          SupplementaryGroups = lib.optional (cfg.features.sshProtection || cfg.features.systemProtection) "systemd-journal";
-        };
-      };
-
-      # Firewall bouncer service (only when package is available)
-      systemd.services.crowdsec-firewall-bouncer = lib.mkIf bouncerEnabled {
-        description = "CrowdSec Firewall Bouncer";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network.target" "crowdsec.service" ];
-        requires = [ "crowdsec.service" ];
-
-        path = [ pkgs.iptables pkgs.ipset ];
-
-        serviceConfig = {
-          Type = "simple";
-          ExecStartPre = "${bouncerRegisterScript}";
-          ExecStart = "${cfg.bouncer.package}/bin/crowdsec-firewall-bouncer -c /var/lib/crowdsec-firewall-bouncer/config.yaml";
-          Restart = "always";
-          RestartSec = "10s";
-        };
-      };
-    })
-
-    # ==========================================================================
-    # Native Implementation (NixOS 25.11+)
-    # 
-    # NOTE: This implementation is currently disabled by default due to bugs
-    # in the native module. Set implementation = "native" to test.
-    # ==========================================================================
-    (if (useNativeImplementation && hasNativeCrowdsecModule) then {
-      # Workarounds for native module bugs
-      systemd.tmpfiles.rules = [
-        # WORKAROUND #445342: Create state directory
-        "d /var/lib/crowdsec 0755 crowdsec crowdsec - -"
+        STATE_DIR="${stateDir}"
+        CONFIG_DIR="$STATE_DIR/config"
+        DATA_DIR="$STATE_DIR/data"
+        HUB_DIR="$STATE_DIR/hub"
+        PACKAGE="${cfg.package}"
         
-        # WORKAROUND #446764: Create online_api_credentials.yaml
-        "f /var/lib/crowdsec/online_api_credentials.yaml 0640 crowdsec crowdsec - -"
-      ] ++ lib.optionals bouncerEnabled [
-        "d /var/lib/crowdsec-firewall-bouncer 0750 root root - -"
-      ];
+        # Create directories
+        mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$HUB_DIR"
+        
+        # Copy configuration files
+        cp -f ${configFile} "$CONFIG_DIR/config.yaml"
+        cp -f ${profilesFile} "$CONFIG_DIR/profiles.yaml"
+        cp -f ${acquisitionsFile} "$CONFIG_DIR/acquisitions.yaml"
+        cp -f ${simulationFile} "$CONFIG_DIR/simulation.yaml"
+        
+        # Debug: Show acquisitions file content
+        echo "Generated acquisitions.yaml:"
+        cat "$CONFIG_DIR/acquisitions.yaml"
+        echo ""
+        
+        # Copy patterns directory from package (required for parser grok patterns)
+        echo "Looking for patterns directory..."
+        
+        # Try common locations
+        PATTERNS_FOUND=0
+        for PATTERNS_PATH in \
+          "$PACKAGE/share/crowdsec/config/patterns" \
+          "$PACKAGE/share/crowdsec/patterns" \
+          "$PACKAGE/etc/crowdsec/patterns" \
+          ; do
+          if [ -d "$PATTERNS_PATH" ]; then
+            echo "Found patterns at: $PATTERNS_PATH"
+            rm -rf "$CONFIG_DIR/patterns"
+            cp -r "$PATTERNS_PATH" "$CONFIG_DIR/patterns"
+            PATTERNS_FOUND=1
+            break
+          fi
+        done
+        
+        # If not found in common locations, search the entire package
+        if [ "$PATTERNS_FOUND" = "0" ]; then
+          echo "Searching for patterns directory in package..."
+          PATTERNS_PATH=$(find "$PACKAGE" -type d -name "patterns" 2>/dev/null | head -1)
+          if [ -n "$PATTERNS_PATH" ]; then
+            echo "Found patterns at: $PATTERNS_PATH"
+            rm -rf "$CONFIG_DIR/patterns"
+            cp -r "$PATTERNS_PATH" "$CONFIG_DIR/patterns"
+            PATTERNS_FOUND=1
+          fi
+        fi
+        
+        if [ "$PATTERNS_FOUND" = "0" ]; then
+          echo "WARNING: Could not find patterns directory!"
+          echo "Package contents:"
+          ls -la "$PACKAGE/" || true
+          ls -la "$PACKAGE/share/" || true
+          ls -la "$PACKAGE/share/crowdsec/" 2>/dev/null || true
+        fi
+        
+        # Initialize database if it doesn't exist
+        if [ ! -f "$DATA_DIR/crowdsec.db" ]; then
+          echo "Initializing CrowdSec database..."
+          touch "$CONFIG_DIR/local_api_credentials.yaml"
+          touch "$CONFIG_DIR/online_api_credentials.yaml"
+          chmod 640 "$CONFIG_DIR/local_api_credentials.yaml"
+          chmod 640 "$CONFIG_DIR/online_api_credentials.yaml"
+        fi
+        
+        # Generate machine ID if it doesn't exist
+        if [ ! -f "$CONFIG_DIR/local_api_credentials.yaml" ] || [ ! -s "$CONFIG_DIR/local_api_credentials.yaml" ]; then
+          echo "Registering local machine..."
+          cscli -c "$CONFIG_DIR/config.yaml" machines add "$(hostname)" --auto --force || true
+        fi
+        
+        # Update hub index
+        echo "Updating hub index..."
+        cscli -c "$CONFIG_DIR/config.yaml" hub update || true
+        
+        # Set correct ownership
+        chown -R crowdsec:crowdsec "$STATE_DIR"
+      '';
 
-      services.crowdsec = {
-        enable = true;
-        package = cfg.package;
+      # Hub installation script (runs after service is started)
+      hubInstallScript = pkgs.writeShellScript "crowdsec-hub-install" ''
+        set -e
+        export PATH="${lib.makeBinPath [ cfg.package pkgs.coreutils pkgs.gnugrep ]}:$PATH"
+        
+        CONFIG_DIR="${stateDir}/config"
+        
+        # Wait for API to be ready
+        for i in $(seq 1 30); do
+          if cscli -c "$CONFIG_DIR/config.yaml" hub list >/dev/null 2>&1; then
+            break
+          fi
+          sleep 1
+        done
+        
+        # Install collections
+        ${lib.concatMapStringsSep "\n" (c: ''
+          if ! cscli -c "$CONFIG_DIR/config.yaml" collections list 2>/dev/null | grep -q "${c}"; then
+            cscli -c "$CONFIG_DIR/config.yaml" collections install ${c} || true
+          fi
+        '') hubCollections}
+        
+        # Install additional scenarios
+        ${lib.concatMapStringsSep "\n" (s: ''
+          if ! cscli -c "$CONFIG_DIR/config.yaml" scenarios list 2>/dev/null | grep -q "${s}"; then
+            cscli -c "$CONFIG_DIR/config.yaml" scenarios install ${s} || true
+          fi
+        '') cfg.hub.scenarios}
+        
+        # Install additional parsers
+        ${lib.concatMapStringsSep "\n" (p: ''
+          if ! cscli -c "$CONFIG_DIR/config.yaml" parsers list 2>/dev/null | grep -q "${p}"; then
+            cscli -c "$CONFIG_DIR/config.yaml" parsers install ${p} || true
+          fi
+        '') cfg.hub.parsers}
+      '';
 
-        # Hub items to install (only collections - other options may not exist)
-        hub = {
-          collections = hubCollections;
+      # ========================================================================
+      # Firewall Bouncer Configuration
+      # ========================================================================
+      bouncerEnabled = cfg.features.firewallBouncer && cfg.bouncer.package != null;
+      
+      # Whether to use declarative nftables integration
+      useNftablesIntegration = bouncerEnabled && cfg.bouncer.mode == "nftables" && cfg.bouncer.nftablesIntegration;
+
+      # Bouncer config - uses set-only mode when nftablesIntegration is enabled
+      bouncerConfigFile = yamlFormat.generate "crowdsec-firewall-bouncer.yaml" ({
+        mode = cfg.bouncer.mode;
+        update_frequency = "10s";
+        api_url = "http://${cfg.api.listenAddr}:${toString cfg.api.listenPort}/";
+        api_key = "\${BOUNCER_API_KEY}";
+        disable_ipv6 = false;
+        deny_action = cfg.bouncer.denyAction;
+        deny_log = cfg.bouncer.denyLog;
+        deny_log_prefix = cfg.bouncer.denyLogPrefix;
+      } // lib.optionalAttrs (cfg.bouncer.mode == "nftables") {
+        nftables = {
+          ipv4 = {
+            enabled = true;
+            set-only = useNftablesIntegration;
+            table = "crowdsec";
+            chain = "crowdsec-chain";
+            set = "crowdsec-blocklist";
+          };
+          ipv6 = {
+            enabled = true;
+            set-only = useNftablesIntegration;
+            table = "crowdsec6";
+            chain = "crowdsec6-chain";
+            set = "crowdsec6-blocklist";
+          };
         };
+      } // lib.optionalAttrs (cfg.bouncer.mode == "iptables") {
+        iptables_chains = [ "INPUT" "FORWARD" ];
+      } // lib.optionalAttrs (cfg.bouncer.mode == "ipset") {
+        ipset_type = "nethash";
+        ipset = "crowdsec-blocklist";
+        ipset6 = "crowdsec6-blocklist";
+      });
 
-        # Local configuration (acquisitions)
-        localConfig = {
-          inherit acquisitions;
-        } // cfg.extraLocalConfig;
+      bouncerRegisterScript = pkgs.writeShellScript "crowdsec-bouncer-register" ''
+        set -e
+        export PATH="${lib.makeBinPath [ cfg.package pkgs.coreutils pkgs.gnugrep pkgs.gnused ]}:$PATH"
+        
+        CONFIG_DIR="${stateDir}/config"
+        KEY_FILE="/var/lib/crowdsec-firewall-bouncer/api_key"
+        
+        # Wait for CrowdSec API to be ready
+        for i in $(seq 1 60); do
+          if cscli -c "$CONFIG_DIR/config.yaml" bouncers list >/dev/null 2>&1; then
+            break
+          fi
+          sleep 1
+        done
+        
+        # Check if bouncer already registered
+        if ! cscli -c "$CONFIG_DIR/config.yaml" bouncers list 2>/dev/null | grep -q "firewall-bouncer"; then
+          # Register new bouncer and save key
+          KEY=$(cscli -c "$CONFIG_DIR/config.yaml" bouncers add firewall-bouncer -o raw 2>/dev/null || echo "")
+          if [ -n "$KEY" ]; then
+            echo "$KEY" > "$KEY_FILE"
+            chmod 600 "$KEY_FILE"
+          fi
+        fi
+        
+        # Read existing key if registration failed
+        if [ -f "$KEY_FILE" ]; then
+          export BOUNCER_API_KEY=$(cat "$KEY_FILE")
+        fi
+        
+        # Generate config with key substituted
+        if [ -n "$BOUNCER_API_KEY" ]; then
+          sed "s/\''${BOUNCER_API_KEY}/$BOUNCER_API_KEY/g" ${bouncerConfigFile} > /var/lib/crowdsec-firewall-bouncer/config.yaml
+        fi
+      '';
 
-        # Main settings
-        settings = lib.mkMerge [
+    in lib.mkMerge [
+      # ==========================================================================
+      # Common Configuration (both implementations)
+      # ==========================================================================
+      {
+        # Assertions
+        assertions = [
           {
-            # WORKAROUND: BUG #445342 - Enable API server by default
-            general.api.server.enable = true;
+            assertion = !cfg.features.firewallBouncer || cfg.bouncer.package != null;
+            message = ''
+              CrowdSec firewall bouncer is enabled but no package is configured.
+              
+              The bouncer package should be available as pkgs.crowdsec-firewall-bouncer
+              on NixOS 25.11+. If using an older NixOS version, you may need to:
+              
+              1. Upgrade to NixOS 25.11+
+              2. Set infrastructure.crowdsec.features.firewallBouncer = false
+              3. Provide the package from an external source
+            '';
           }
 
-          # Console enrollment (if configured)
-          (lib.mkIf (cfg.console.enrollKeyFile != null) {
-            console.tokenFile = cfg.console.enrollKeyFile;
-          })
-
-          # User's extra settings
-          cfg.extraSettings
+          {
+            assertion = acquisitions != [];
+            message = ''
+              CrowdSec requires at least one acquisition source.
+              
+              Enable at least one of:
+              - infrastructure.crowdsec.features.sshProtection = true
+              - infrastructure.crowdsec.features.nginxProtection = true
+              - infrastructure.crowdsec.features.systemProtection = true
+              
+              Or add custom acquisitions via infrastructure.crowdsec.acquisitions
+            '';
+          }
+          {
+            assertion = cfg.implementation != "native" || hasNativeCrowdsecModule;
+            message = ''
+              CrowdSec native implementation requires NixOS 25.11 or later.
+              
+              Either:
+              1. Upgrade to NixOS 25.11+
+              2. Set infrastructure.crowdsec.implementation = "custom"
+              3. Set infrastructure.crowdsec.implementation = "auto" (recommended)
+            '';
+          }
         ];
-      };
 
-      # Firewall bouncer service (custom - not yet in native nixpkgs)
-      systemd.services.crowdsec-firewall-bouncer = lib.mkIf bouncerEnabled {
-        description = "CrowdSec Firewall Bouncer";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "network.target" "crowdsec.service" ];
-        requires = [ "crowdsec.service" ];
+        # Open firewall for LAPI if configured
+        networking.firewall.allowedTCPPorts = 
+          lib.mkIf cfg.api.openFirewall [ cfg.api.listenPort ];
 
-        path = [ pkgs.iptables pkgs.ipset ];
+        # Install useful CLI tools
+        environment.systemPackages = [ 
+          cfg.package  # Includes cscli
+        ] ++ lib.optionals (bouncerEnabled && cfg.bouncer.mode == "nftables") [
+          pkgs.nftables
+        ] ++ lib.optionals (bouncerEnabled && cfg.bouncer.mode == "iptables") [
+          pkgs.iptables
+        ] ++ lib.optionals (bouncerEnabled && cfg.bouncer.mode == "ipset") [
+          pkgs.ipset
+        ];
+      }
 
-        serviceConfig = {
-          Type = "simple";
-          ExecStartPre = "${bouncerRegisterScript}";
-          ExecStart = "${cfg.bouncer.package}/bin/crowdsec-firewall-bouncer -c /var/lib/crowdsec-firewall-bouncer/config.yaml";
-          Restart = "always";
-          RestartSec = "10s";
+      # ==========================================================================
+      # Declarative nftables Integration
+      # ==========================================================================
+      (lib.mkIf useNftablesIntegration {
+        networking.nftables.enable = true;
+        
+        networking.nftables.tables = {
+          # IPv4 CrowdSec table
+          crowdsec = {
+            family = "ip";
+            content = ''
+              set crowdsec-blocklist {
+                type ipv4_addr
+                flags timeout
+              }
+              
+              chain crowdsec-chain {
+                type filter hook input priority -1; policy accept;
+                ${lib.optionalString cfg.bouncer.denyLog ''
+                ip saddr @crowdsec-blocklist log prefix "${cfg.bouncer.denyLogPrefix}" 
+                ''}
+                ip saddr @crowdsec-blocklist ${lib.toLower cfg.bouncer.denyAction}
+              }
+            '';
+          };
+          
+          # IPv6 CrowdSec table
+          crowdsec6 = {
+            family = "ip6";
+            content = ''
+              set crowdsec6-blocklist {
+                type ipv6_addr
+                flags timeout
+              }
+              
+              chain crowdsec6-chain {
+                type filter hook input priority -1; policy accept;
+                ${lib.optionalString cfg.bouncer.denyLog ''
+                ip6 saddr @crowdsec6-blocklist log prefix "${cfg.bouncer.denyLogPrefix}" 
+                ''}
+                ip6 saddr @crowdsec6-blocklist ${lib.toLower cfg.bouncer.denyAction}
+              }
+            '';
+          };
         };
-      };
-    } else {})
-  ]);
+      })
+
+      # ==========================================================================
+      # Custom Implementation
+      # ==========================================================================
+      (lib.mkIf (!useNativeImplementation) {
+        # Create crowdsec user and group
+        users.users.crowdsec = {
+          isSystemUser = true;
+          group = "crowdsec";
+          home = stateDir;
+          description = "CrowdSec daemon user";
+        };
+        users.groups.crowdsec = {};
+
+        # Ensure data directories exist and create config symlink for cscli
+        systemd.tmpfiles.rules = [
+          "d ${stateDir} 0755 crowdsec crowdsec - -"
+          "d ${stateDir}/config 0755 crowdsec crowdsec - -"
+          "d ${stateDir}/data 0755 crowdsec crowdsec - -"
+          "d ${stateDir}/hub 0755 crowdsec crowdsec - -"
+          # Create /etc/crowdsec directory and symlink for cscli default config path
+          "d /etc/crowdsec 0755 root root - -"
+          "L+ /etc/crowdsec/config.yaml - - - - ${stateDir}/config/config.yaml"
+        ] ++ lib.optionals bouncerEnabled [
+          "d /var/lib/crowdsec-firewall-bouncer 0750 root root - -"
+        ];
+
+        # Main CrowdSec service
+        systemd.services.crowdsec = {
+          description = "CrowdSec Security Engine";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "network.target" "local-fs.target" ];
+
+          serviceConfig = {
+            Type = "simple";
+            User = "crowdsec";
+            Group = "crowdsec";
+            ExecStartPre = [
+              "+${initScript}"  # Run as root for permissions
+            ];
+            ExecStart = "${cfg.package}/bin/crowdsec -c ${stateDir}/config/config.yaml";
+            ExecStartPost = "${hubInstallScript}";
+            Restart = "always";
+            RestartSec = "10s";
+            
+            # Security hardening
+            ProtectSystem = "strict";
+            ProtectHome = true;
+            PrivateTmp = true;
+            NoNewPrivileges = true;
+            ReadWritePaths = [ stateDir ];
+            
+            # Allow journal access for systemd log sources
+            SupplementaryGroups = lib.optional (cfg.features.sshProtection || cfg.features.systemProtection) "systemd-journal";
+          };
+        };
+
+        # Firewall bouncer service (only when package is available)
+        systemd.services.crowdsec-firewall-bouncer = lib.mkIf bouncerEnabled {
+          description = "CrowdSec Firewall Bouncer";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "network.target" "crowdsec.service" ];
+          requires = [ "crowdsec.service" ];
+
+          path = [ pkgs.iptables pkgs.ipset ];
+
+          serviceConfig = {
+            Type = "simple";
+            ExecStartPre = "${bouncerRegisterScript}";
+            ExecStart = "${cfg.bouncer.package}/bin/crowdsec-firewall-bouncer -c /var/lib/crowdsec-firewall-bouncer/config.yaml";
+            Restart = "always";
+            RestartSec = "10s";
+          };
+        };
+      })
+
+      # ==========================================================================
+      # Native Implementation (NixOS 25.11+)
+      # ==========================================================================
+      (lib.mkIf (useNativeImplementation && hasNativeCrowdsecModule) {
+        # Workarounds for native module bugs
+        systemd.tmpfiles.rules = [
+          # WORKAROUND #445342: Create state directory
+          "d /var/lib/crowdsec 0755 crowdsec crowdsec - -"
+          
+          # WORKAROUND #446764: Create online_api_credentials.yaml
+          "f /var/lib/crowdsec/online_api_credentials.yaml 0640 crowdsec crowdsec - -"
+        ] ++ lib.optionals bouncerEnabled [
+          "d /var/lib/crowdsec-firewall-bouncer 0750 root root - -"
+        ];
+
+        services.crowdsec = {
+          enable = true;
+          package = cfg.package;
+
+          # Hub items to install (only collections - other options may not exist)
+          hub = {
+            collections = hubCollections;
+          };
+
+          # Local configuration (acquisitions)
+          localConfig = {
+            inherit acquisitions;
+          } // cfg.extraLocalConfig;
+
+          # Main settings
+          settings = lib.mkMerge [
+            {
+              # WORKAROUND: BUG #445342 - Enable API server by default
+              general.api.server.enable = true;
+            }
+
+            # Console enrollment (if configured)
+            (lib.mkIf (cfg.console.enrollKeyFile != null) {
+              console.tokenFile = cfg.console.enrollKeyFile;
+            })
+
+            # User's extra settings
+            cfg.extraSettings
+          ];
+        };
+
+        # Firewall bouncer service (custom - not yet in native nixpkgs)
+        systemd.services.crowdsec-firewall-bouncer = lib.mkIf bouncerEnabled {
+          description = "CrowdSec Firewall Bouncer";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "network.target" "crowdsec.service" ];
+          requires = [ "crowdsec.service" ];
+
+          path = [ pkgs.iptables pkgs.ipset ];
+
+          serviceConfig = {
+            Type = "simple";
+            ExecStartPre = "${bouncerRegisterScript}";
+            ExecStart = "${cfg.bouncer.package}/bin/crowdsec-firewall-bouncer -c /var/lib/crowdsec-firewall-bouncer/config.yaml";
+            Restart = "always";
+            RestartSec = "10s";
+          };
+        };
+      })
+    ]
+  );
 }
