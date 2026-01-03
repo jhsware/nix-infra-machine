@@ -1066,7 +1066,7 @@ in
     # NOTE: This implementation is currently disabled by default due to bugs
     # in the native module. Set implementation = "native" to test.
     # ==========================================================================
-    (lib.mkIf useNativeImplementation {
+    (if (useNativeImplementation && hasNativeCrowdsecModule) then {
       # Workarounds for native module bugs
       systemd.tmpfiles.rules = [
         # WORKAROUND #445342: Create state directory
@@ -1126,6 +1126,6 @@ in
           RestartSec = "10s";
         };
       };
-    })
+    } else {})
   ]);
 }
