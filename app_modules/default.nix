@@ -1,6 +1,5 @@
 {
   imports = [
-    ./crowdsec
     ./elasticsearch
     ./haproxy
     ./home-assistant
@@ -8,7 +7,6 @@
     ./minio
     ./mongodb
     ./mongodb-pod
-    ./n8n
     ./n8n-pod
     ./nextcloud
     ./nginx

@@ -266,7 +266,8 @@ in
 
     # Environment variables must be set through systemd service
     # This approach works on both NixOS 25.05 and 25.11+
-    systemd.services.n8n.environment = n8nEnvironment;
+    # Use mkForce to override the native module's default null values
+    systemd.services.n8n.environment = lib.mkForce n8nEnvironment;
 
     # ==========================================================================
     # Nginx Reverse Proxy (Optional)

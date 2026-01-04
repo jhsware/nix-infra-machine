@@ -1,4 +1,9 @@
 { config, pkgs, lib, ... }: {
+  imports = [
+    # Import based on file structure on deployed machine
+    ./app_modules/_unstable/n8n/default.nix
+  ];
+
   # ==========================================================================
   # Swap Configuration (for memory-intensive n8n builds)
   # ==========================================================================

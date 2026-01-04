@@ -1,4 +1,9 @@
 { config, pkgs, lib, ... }: {
+  imports = [
+    # Import based on file structure on deployed machine
+    ./app_modules/_unstable/crowdsec/default.nix
+  ];
+
   # Enable CrowdSec using the infrastructure module
   infrastructure.crowdsec = {
     enable = true;
