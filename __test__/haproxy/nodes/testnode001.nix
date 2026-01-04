@@ -1,8 +1,24 @@
 { config, pkgs, lib, ... }: {
-  # Enable HAProxy with test configuration
+  # Enable HAProxy with test configuration including HTTPS
   config.infrastructure.haproxy = {
     enable = true;
     openFirewall = true;
+
+    # Enable self-signed certificates for testing HTTPS
+    selfSigned = {
+      enable = true;
+      domains = [ "localhost" "test.local" ];
+    };
+
+    # SSL/TLS settings
+    ssl = {
+      minVersion = "TLSv1.2";
+      hsts = {
+        enable = true;
+        maxAge = 31536000;
+        includeSubDomains = true;
+      };
+    };
 
     # Note: ACME/Let's Encrypt cannot be fully tested in VM environment
     # as it requires DNS resolution and public internet access.
@@ -34,6 +50,26 @@
           "health_backend if is_health"
           "api_backend if is_api"
           "acme_backend if is_acme"
+        ];
+        defaultBackend = "web_backend";
+      };
+
+      # HTTPS frontend - handles incoming HTTPS traffic with self-signed cert
+      https-in = {
+        bind = [ "*:443 ssl crt /var/lib/haproxy/certs/localhost.pem" ];
+        mode = "http";
+        options = [ "httplog" ];
+        acls = [
+          "is_health path /health"
+          "is_api path_beg /api"
+        ];
+        httpRequest = [
+          "set-header X-Forwarded-Proto https"
+          "set-header X-Forwarded-For %[src]"
+        ];
+        useBackend = [
+          "health_backend if is_health"
+          "api_backend if is_api"
         ];
         defaultBackend = "web_backend";
       };
@@ -121,3 +157,4 @@
     python3
   ];
 }
+

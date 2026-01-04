@@ -7,6 +7,9 @@ let
   # Generate combined PEM file path for a domain
   combinedPemPath = domain: "/var/lib/acme/${domain}/combined.pem";
 
+  # Self-signed certificate directory
+  selfSignedCertDir = "/var/lib/haproxy/certs";
+
   # Script to concatenate fullchain.pem and privkey.pem for HAProxy
   # HAProxy requires a single file with cert chain + private key
   mkCombinePemScript = domain: pkgs.writeShellScript "combine-pem-${domain}" ''
@@ -17,6 +20,31 @@ let
       cat "$ACME_DIR/fullchain.pem" "$ACME_DIR/privkey.pem" > "$COMBINED"
       chmod 640 "$COMBINED"
       chown acme:haproxy "$COMBINED"
+    fi
+  '';
+
+  # Script to generate self-signed certificates for testing
+  mkSelfSignedCertScript = domain: pkgs.writeShellScript "generate-self-signed-${domain}" ''
+    CERT_DIR="${selfSignedCertDir}"
+    COMBINED="$CERT_DIR/${domain}.pem"
+    
+    mkdir -p "$CERT_DIR"
+    
+    # Only generate if not exists or expired
+    if [ ! -f "$COMBINED" ] || ! ${pkgs.openssl}/bin/openssl x509 -checkend 86400 -noout -in "$COMBINED" 2>/dev/null; then
+      echo "Generating self-signed certificate for ${domain}..."
+      ${pkgs.openssl}/bin/openssl req -x509 -newkey rsa:4096 \
+        -keyout "$CERT_DIR/${domain}.key" \
+        -out "$CERT_DIR/${domain}.crt" \
+        -sha256 -days 365 -nodes \
+        -subj "/CN=${domain}" \
+        -addext "subjectAltName=DNS:${domain},DNS:*.${domain}"
+      
+      # Combine for HAProxy
+      cat "$CERT_DIR/${domain}.crt" "$CERT_DIR/${domain}.key" > "$COMBINED"
+      chmod 640 "$COMBINED"
+      chown haproxy:haproxy "$COMBINED"
+      rm -f "$CERT_DIR/${domain}.key" "$CERT_DIR/${domain}.crt"
     fi
   '';
 
@@ -173,6 +201,113 @@ in
     };
 
     # ==========================================================================
+    # Self-Signed Certificate Configuration (for testing)
+    # ==========================================================================
+
+    selfSigned = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        description = ''
+          Enable self-signed certificate generation for testing.
+          These certificates are NOT trusted by browsers but useful for development/testing.
+        '';
+        default = false;
+      };
+
+      domains = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        description = "List of domains to generate self-signed certificates for.";
+        default = [];
+        example = [ "localhost" "test.local" ];
+      };
+
+      regenerate = lib.mkOption {
+        type = lib.types.bool;
+        description = "Force regeneration of self-signed certificates on each activation.";
+        default = false;
+      };
+    };
+
+    # ==========================================================================
+    # SSL/TLS Configuration
+    # ==========================================================================
+
+    ssl = {
+      minVersion = lib.mkOption {
+        type = lib.types.enum [ "TLSv1.2" "TLSv1.3" ];
+        description = "Minimum TLS version to accept.";
+        default = "TLSv1.2";
+      };
+
+      ciphers = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        description = "Custom cipher suite for TLS 1.2 and below.";
+        default = null;
+        example = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256";
+      };
+
+      ciphersuites = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        description = "Custom cipher suite for TLS 1.3.";
+        default = null;
+        example = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384";
+      };
+
+      hsts = {
+        enable = lib.mkOption {
+          type = lib.types.bool;
+          description = "Enable HTTP Strict Transport Security (HSTS) header.";
+          default = false;
+        };
+
+        maxAge = lib.mkOption {
+          type = lib.types.int;
+          description = "HSTS max-age in seconds.";
+          default = 31536000;  # 1 year
+        };
+
+        includeSubDomains = lib.mkOption {
+          type = lib.types.bool;
+          description = "Include subdomains in HSTS policy.";
+          default = true;
+        };
+
+        preload = lib.mkOption {
+          type = lib.types.bool;
+          description = "Add preload directive to HSTS header.";
+          default = false;
+        };
+      };
+    };
+
+    # ==========================================================================
+    # HTTP to HTTPS Redirect
+    # ==========================================================================
+
+    httpToHttpsRedirect = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        description = ''
+          Automatically redirect HTTP requests to HTTPS.
+          Creates a frontend on port 80 that redirects all traffic to HTTPS.
+        '';
+        default = false;
+      };
+
+      code = lib.mkOption {
+        type = lib.types.enum [ 301 302 307 308 ];
+        description = "HTTP redirect status code to use.";
+        default = 301;
+      };
+
+      excludePaths = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        description = "Paths to exclude from redirect (e.g., ACME challenge).";
+        default = [ "/.well-known/acme-challenge/" ];
+      };
+    };
+
+    # ==========================================================================
     # HAProxy Configuration
     # ==========================================================================
 
@@ -232,6 +367,18 @@ in
             description = "http-request rules.";
             default = [];
             example = [ "set-header X-Forwarded-Proto https if { ssl_fc }" ];
+          };
+          httpResponse = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            description = "http-response rules.";
+            default = [];
+            example = [ "set-header Strict-Transport-Security max-age=31536000" ];
+          };
+          tcpRequest = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            description = "tcp-request rules (for TCP mode).";
+            default = [];
+            example = [ "inspect-delay 5s" "content accept if { req_ssl_hello_type 1 }" ];
           };
           useBackend = lib.mkOption {
             type = lib.types.listOf lib.types.str;
@@ -298,6 +445,12 @@ in
             type = lib.types.listOf lib.types.str;
             description = "http-response rules for this backend.";
             default = [];
+          };
+          tcpCheck = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            description = "tcp-check rules for TCP mode health checking.";
+            default = [];
+            example = [ "connect" "send PING\\r\\n" "expect string +PONG" ];
           };
           servers = lib.mkOption {
             type = lib.types.listOf lib.types.str;
@@ -385,6 +538,22 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # Assertions
+    assertions = [
+      {
+        assertion = !(cfg.acme.enable && cfg.selfSigned.enable);
+        message = "Cannot enable both ACME and self-signed certificates. Choose one.";
+      }
+      {
+        assertion = cfg.acme.enable -> cfg.acme.acceptTerms;
+        message = "You must accept the ACME terms of service to use Let's Encrypt.";
+      }
+      {
+        assertion = cfg.acme.enable -> cfg.acme.email != null;
+        message = "You must provide an email address for ACME certificate registration.";
+      }
+    ];
+
     # ACME configuration for Let's Encrypt
     security.acme = lib.mkIf cfg.acme.enable {
       acceptTerms = cfg.acme.acceptTerms;
@@ -414,12 +583,30 @@ in
       extraGroups = [ "acme" ];
     };
 
-    # Create ACME challenge directory for webroot validation
-    systemd.tmpfiles.rules = lib.mkIf cfg.acme.enable [
-      "d /var/lib/acme/acme-challenge 0755 acme acme -"
-      "d /var/lib/acme/acme-challenge/.well-known 0755 acme acme -"
-      "d /var/lib/acme/acme-challenge/.well-known/acme-challenge 0755 acme acme -"
-    ];
+    # Create directories for ACME and self-signed certificates
+    systemd.tmpfiles.rules = 
+      lib.optionals cfg.acme.enable [
+        "d /var/lib/acme/acme-challenge 0755 acme acme -"
+        "d /var/lib/acme/acme-challenge/.well-known 0755 acme acme -"
+        "d /var/lib/acme/acme-challenge/.well-known/acme-challenge 0755 acme acme -"
+      ] ++
+      lib.optionals cfg.selfSigned.enable [
+        "d ${selfSignedCertDir} 0750 haproxy haproxy -"
+      ];
+
+    # Self-signed certificate generation service
+    systemd.services.haproxy-generate-self-signed = lib.mkIf cfg.selfSigned.enable {
+      description = "Generate self-signed certificates for HAProxy";
+      wantedBy = [ "haproxy.service" ];
+      before = [ "haproxy.service" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = lib.concatMapStringsSep "\n" (domain: 
+        "${mkSelfSignedCertScript domain}"
+      ) cfg.selfSigned.domains;
+    };
 
     # HAProxy configuration
     services.haproxy = {
@@ -429,6 +616,23 @@ in
       group = cfg.group;
 
       config = let
+        # HSTS header value
+        hstsHeader = lib.optionalString cfg.ssl.hsts.enable (
+          "max-age=${toString cfg.ssl.hsts.maxAge}" +
+          lib.optionalString cfg.ssl.hsts.includeSubDomains "; includeSubDomains" +
+          lib.optionalString cfg.ssl.hsts.preload "; preload"
+        );
+
+        # HTTP to HTTPS redirect frontend
+        httpRedirectFrontend = lib.optionalString cfg.httpToHttpsRedirect.enable ''
+          frontend http-redirect
+            bind *:80
+            mode http
+            ${lib.concatMapStringsSep "\n  " (path: "acl is_acme path_beg ${path}") cfg.httpToHttpsRedirect.excludePaths}
+            ${lib.optionalString (cfg.httpToHttpsRedirect.excludePaths != []) "use_backend acme_backend if is_acme"}
+            http-request redirect scheme https code ${toString cfg.httpToHttpsRedirect.code} unless { ssl_fc }${lib.optionalString (cfg.httpToHttpsRedirect.excludePaths != []) " or is_acme"}
+        '';
+
         # Generate frontend configuration
         frontendConfigs = lib.concatStringsSep "\n\n" (lib.mapAttrsToList (name: frontend: ''
           frontend ${name}
@@ -437,6 +641,9 @@ in
             ${lib.concatMapStringsSep "\n  " (o: "option ${o}") frontend.options}
             ${lib.concatMapStringsSep "\n  " (a: "acl ${a}") frontend.acls}
             ${lib.concatMapStringsSep "\n  " (r: "http-request ${r}") frontend.httpRequest}
+            ${lib.concatMapStringsSep "\n  " (r: "http-response ${r}") frontend.httpResponse}
+            ${lib.concatMapStringsSep "\n  " (r: "tcp-request ${r}") frontend.tcpRequest}
+            ${lib.optionalString (cfg.ssl.hsts.enable && frontend.mode == "http") "http-response set-header Strict-Transport-Security \"${hstsHeader}\""}
             ${lib.concatMapStringsSep "\n  " (u: "use_backend ${u}") frontend.useBackend}
             ${lib.optionalString (frontend.defaultBackend != null) "default_backend ${frontend.defaultBackend}"}
             ${frontend.extraConfig}
@@ -450,6 +657,7 @@ in
             ${lib.concatMapStringsSep "\n  " (o: "option ${o}") backend.options}
             ${lib.concatMapStringsSep "\n  " (r: "http-request ${r}") backend.httpRequest}
             ${lib.concatMapStringsSep "\n  " (r: "http-response ${r}") backend.httpResponse}
+            ${lib.concatMapStringsSep "\n  " (c: "tcp-check ${c}") backend.tcpCheck}
             ${lib.concatMapStringsSep "\n  " (s: "server ${s}") backend.servers}
             ${backend.extraConfig}
         '') cfg.backends);
@@ -470,6 +678,8 @@ in
 
         ${cfg.defaultsConfig}
 
+        ${httpRedirectFrontend}
+
         ${frontendConfigs}
 
         ${backendConfigs}
@@ -480,15 +690,23 @@ in
       '';
     };
 
-    # Ensure HAProxy starts after ACME certificates are ready
-    systemd.services.haproxy = lib.mkIf cfg.acme.enable {
-      wants = lib.mapAttrsToList (domain: _: "acme-${domain}.service") cfg.acme.domains;
-      after = lib.mapAttrsToList (domain: _: "acme-${domain}.service") cfg.acme.domains;
-      serviceConfig = {
-        # Allow HAProxy to reload without restart
-        ExecReload = "${pkgs.coreutils}/bin/kill -USR2 $MAINPID";
-      };
-    };
+    # Ensure HAProxy starts after certificates are ready
+    systemd.services.haproxy = lib.mkMerge [
+      (lib.mkIf cfg.acme.enable {
+        wants = lib.mapAttrsToList (domain: _: "acme-${domain}.service") cfg.acme.domains;
+        after = lib.mapAttrsToList (domain: _: "acme-${domain}.service") cfg.acme.domains;
+      })
+      (lib.mkIf cfg.selfSigned.enable {
+        wants = [ "haproxy-generate-self-signed.service" ];
+        after = [ "haproxy-generate-self-signed.service" ];
+      })
+      {
+        serviceConfig = {
+          # Allow HAProxy to reload without restart
+          ExecReload = "${pkgs.coreutils}/bin/kill -USR2 $MAINPID";
+        };
+      }
+    ];
 
     # Open firewall for HTTP/HTTPS
     networking.firewall.allowedTCPPorts = lib.mkIf cfg.openFirewall [ 80 443 ];
@@ -497,3 +715,4 @@ in
     environment.systemPackages = [ cfg.package pkgs.curl pkgs.openssl ];
   };
 }
+
