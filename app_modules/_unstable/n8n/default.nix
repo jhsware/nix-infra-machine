@@ -5,6 +5,13 @@ let
 
   cfg = config.infrastructure.${appName};
 
+  # Build the custom n8n package with version selection
+  n8nPackage = if cfg.package != null then cfg.package else
+    pkgs.callPackage ./package.nix {
+      version = cfg.version;
+      buildMemoryMB = cfg.buildMemoryMB;
+    };
+
   # Environment variables for n8n configuration
   n8nEnvironment = {
     # Network settings
@@ -34,8 +41,34 @@ in
     enable = lib.mkEnableOption "infrastructure.n8n";
 
     # ==========================================================================
-    # Build Configuration
+    # Package and Version Configuration
     # ==========================================================================
+
+    version = lib.mkOption {
+      type = lib.types.str;
+      description = ''
+        n8n version to install.
+        
+        Supported versions are defined in package.nix. To add a new version,
+        you need to compute the source and pnpm dependency hashes.
+        
+        See package.nix for instructions on adding new versions.
+      '';
+      default = "2.1.5";
+      example = "1.120.4";
+    };
+
+    package = lib.mkOption {
+      type = lib.types.nullOr lib.types.package;
+      description = ''
+        Custom n8n package to use. If null, the package will be built
+        using the version specified in 'version' option.
+        
+        Use this to provide a completely custom n8n build.
+      '';
+      default = null;
+      example = lib.literalExpression "pkgs.n8n";
+    };
 
     buildMemoryMB = lib.mkOption {
       type = lib.types.int;
@@ -234,40 +267,64 @@ in
 
   config = lib.mkIf cfg.enable {
     # ==========================================================================
-    # Allow insecure n8n package (marked insecure due to CVE)
+    # Disable the native n8n service (we'll configure our own systemd service)
     # ==========================================================================
 
-    nixpkgs.config.permittedInsecurePackages = [
-      "n8n-1.91.3"
-    ];
+    # Do NOT enable services.n8n - we create our own service to have full control
 
     # ==========================================================================
-    # Override n8n package with increased memory for build
+    # n8n User and Group
     # ==========================================================================
 
-    nixpkgs.overlays = [
-      (final: prev: {
-        n8n = prev.n8n.overrideAttrs (oldAttrs: {
-          env = (oldAttrs.env or {}) // {
-            NODE_OPTIONS = "--max-old-space-size=${toString cfg.buildMemoryMB}";
-          };
-        });
-      })
-    ];
-
-    # ==========================================================================
-    # n8n Service Configuration
-    # ==========================================================================
-
-    services.n8n = {
-      enable = true;
-      openFirewall = cfg.openFirewall;
+    users.users.n8n = {
+      isSystemUser = true;
+      group = "n8n";
+      home = cfg.dataDir;
+      createHome = true;
+      description = "n8n service user";
     };
 
-    # Environment variables must be set through systemd service
-    # This approach works on both NixOS 25.05 and 25.11+
-    # Use mkForce to override the native module's default null values
-    systemd.services.n8n.environment = lib.mkForce n8nEnvironment;
+    users.groups.n8n = {};
+
+    # ==========================================================================
+    # n8n Systemd Service
+    # ==========================================================================
+
+    systemd.services.n8n = {
+      description = "n8n - Workflow Automation";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network.target" ] ++ 
+        lib.optionals cfg.reverseProxy.enable [ "nginx.service" ] ++
+        lib.optionals (cfg.database.type == "postgresdb" && cfg.database.postgresdb.createLocally) [
+          "postgresql.service"
+          "n8n-db-setup.service"
+        ];
+      wants = lib.optionals (cfg.database.type == "postgresdb" && cfg.database.postgresdb.createLocally) [
+        "n8n-db-setup.service"
+      ];
+      requires = lib.optionals (cfg.database.type == "postgresdb" && cfg.database.postgresdb.createLocally) [
+        "postgresql.service"
+      ];
+
+      environment = n8nEnvironment;
+
+      serviceConfig = {
+        Type = "simple";
+        User = "n8n";
+        Group = "n8n";
+        WorkingDirectory = cfg.dataDir;
+        ExecStart = "${n8nPackage}/bin/n8n";
+        Restart = "on-failure";
+        RestartSec = "5s";
+
+        # Hardening
+        NoNewPrivileges = true;
+        PrivateTmp = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        ReadWritePaths = [ cfg.dataDir ];
+      };
+    };
 
     # ==========================================================================
     # Nginx Reverse Proxy (Optional)
@@ -311,22 +368,6 @@ in
     # ==========================================================================
     # Service Dependencies
     # ==========================================================================
-
-    systemd.services.n8n = {
-      after = lib.mkMerge [
-        (lib.mkIf cfg.reverseProxy.enable [ "nginx.service" ])
-        (lib.mkIf (cfg.database.type == "postgresdb" && cfg.database.postgresdb.createLocally) [
-          "postgresql.service"
-          "n8n-db-setup.service"
-        ])
-      ];
-      wants = lib.mkIf (cfg.database.type == "postgresdb" && cfg.database.postgresdb.createLocally) [
-        "n8n-db-setup.service"
-      ];
-      requires = lib.mkIf (cfg.database.type == "postgresdb" && cfg.database.postgresdb.createLocally) [
-        "postgresql.service"
-      ];
-    };
 
     systemd.services.nginx = lib.mkIf cfg.reverseProxy.enable {
       wants = [ "n8n.service" ];
