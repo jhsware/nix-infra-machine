@@ -12,6 +12,7 @@
     ./nginx
     ./opensearch
     ./postgresql
+    ./rabbitmq
     ./redis
   ];
 }
