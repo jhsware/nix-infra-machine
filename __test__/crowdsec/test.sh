@@ -250,8 +250,31 @@ if [ "$AUDITD_ENABLED" = "true" ]; then
       echo -e "  ${YELLOW}!${NC} Auditd service status: $auditd_status [warning]"
     fi
     
+    # Check audit-rules-nixos service status and errors
+    echo "  Checking audit-rules-nixos service..."
+    audit_rules_status=$(cmd_clean "$node" "systemctl is-active audit-rules-nixos 2>&1 || echo 'inactive'")
+    # Service might be one-shot, check if it succeeded
+    audit_rules_result=$(cmd_clean "$node" "systemctl show audit-rules-nixos --property=Result 2>&1 || echo 'unknown'")
+    if [[ "$audit_rules_result" == *"success"* ]]; then
+      echo -e "  ${GREEN}✓${NC} Audit rules loaded successfully [pass]"
+    else
+      echo -e "  ${YELLOW}!${NC} Audit rules service result: $audit_rules_result [warning]"
+      # Show the actual error
+      echo "  Debugging audit rules failure..."
+      audit_rules_file=$(cmd_clean "$node" "find /nix/store -name 'audit.rules' -path '*-audit.rules*' 2>/dev/null | head -1 || echo 'not found'")
+      echo "    Audit rules file: $audit_rules_file"
+      if [[ "$audit_rules_file" != "not found" ]] && [[ -n "$audit_rules_file" ]]; then
+        echo "    Rules file contents:"
+        audit_rules_content=$(cmd_clean "$node" "cat '$audit_rules_file' 2>&1 || echo 'cannot read'")
+        echo "$audit_rules_content" | while read line; do echo "      $line"; done
+        echo "    Trying to load rules manually..."
+        manual_load=$(cmd_clean "$node" "auditctl -R '$audit_rules_file' 2>&1 || echo 'load failed'")
+        echo "    Manual load result: $manual_load"
+      fi
+    fi
+    
     # Check if audit rules are loaded
-    echo "  Checking audit rules..."
+    echo "  Checking loaded audit rules..."
     audit_rules=$(cmd_clean "$node" "auditctl -l 2>&1 || echo 'no rules'")
     if [[ "$audit_rules" == *"passwd"* ]] || [[ "$audit_rules" == *"shadow"* ]]; then
       echo -e "  ${GREEN}✓${NC} Audit rules for identity files loaded [pass]"

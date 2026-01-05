@@ -63,8 +63,8 @@
     # Auditd integration for kernel-level security monitoring
     auditd = {
       enable = true;
-      # Whitelist common NixOS wrapper processes to reduce noise
-      nixWrappersWhitelistProcess = [ "sshd" "systemd" "sudo" "su" ];
+      # Note: nixWrappersWhitelistProcess is currently disabled due to
+      # auditd compatibility issues with the 'comm' field filter
       # Add custom audit rules for sensitive files
       rules = [
         "-w /etc/passwd -p wa -k identity"

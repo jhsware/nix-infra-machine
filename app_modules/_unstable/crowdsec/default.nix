@@ -545,16 +545,15 @@ in
       nixWrappersWhitelistProcess = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         description = ''
-          List of process names to whitelist from auditd monitoring when
-          they execute NixOS wrapper scripts.
+          List of process names to whitelist from auditd monitoring.
+          
+          NOTE: This feature is currently disabled due to compatibility issues
+          with the 'comm' field filter in some versions of auditd. The option
+          is preserved for future use when auditd compatibility is resolved.
           
           NixOS uses wrapper scripts in /run/wrappers/bin for setuid/setgid
           programs (like sudo, ping, etc.). These wrappers can generate a lot
-          of noise in auditd logs. This option allows you to whitelist specific
-          processes that legitimately use these wrappers.
-          
-          The whitelist is applied to auditd rules that monitor execve calls
-          on wrapper binaries.
+          of noise in auditd logs.
           
           [NIS2 COMPLIANCE]
           Article 21(2)(g) - Security Monitoring: Reduces audit log noise
@@ -1139,14 +1138,10 @@ in
       (lib.mkIf auditdEnabled {
         security.auditd.enable = true;
         
-        # Add user-defined rules plus whitelist rules for NixOS wrapper processes
-        # Note: auditd's exe filter doesn't support wildcards, so we use comm only
-        # This whitelists by process name which is sufficient for reducing noise
-        security.audit.rules = cfg.auditd.rules ++ (lib.optionals (cfg.auditd.nixWrappersWhitelistProcess != []) (
-          map (proc:
-            "-a never,exit -F arch=b64 -S execve -F comm=${proc}"
-          ) cfg.auditd.nixWrappersWhitelistProcess
-        ));
+        # Add user-defined audit rules only
+        # Note: The nixWrappersWhitelistProcess feature is currently disabled
+        # due to auditd compatibility issues with the 'comm' field filter
+        security.audit.rules = cfg.auditd.rules;
       })
 
       # ==========================================================================
