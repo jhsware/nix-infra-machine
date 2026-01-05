@@ -25,8 +25,12 @@
       # Enable system/kernel protection
       systemProtection = true;
       
-      # Disable firewall bouncer (package not available in NixOS 25.05)
-      firewallBouncer = false;
+      # Enable firewall bouncer (now available in NixOS 25.11)
+      firewallBouncer = true;
+      
+      # Disable HAProxy protection (package not available in standard nixpkgs)
+      # Enable this when cs-haproxy-spoa-bouncer is added to nixpkgs
+      haproxyProtection = false;
       
       # Enable community blocklists (requires enrollment in production)
       communityBlocklists = true;
@@ -38,12 +42,36 @@
       shareDecisions = false;
     };
     
-    # Bouncer configuration (for when enabled)
+    # Bouncer configuration (nftables mode with declarative integration)
     bouncer = {
+      mode = "nftables";
+      nftablesIntegration = true;
       denyAction = "DROP";
       denyLog = true;
       denyLogPrefix = "crowdsec-test: ";
       banDuration = "4h";
+    };
+    
+    # HAProxy SPOA bouncer configuration (for when package becomes available)
+    haproxy = {
+      listenAddr = "127.0.0.1";
+      listenPort = 3000;
+      action = "deny";
+      logLevel = "info";
+    };
+    
+    # Auditd integration for kernel-level security monitoring
+    auditd = {
+      enable = true;
+      # Whitelist common NixOS wrapper processes to reduce noise
+      nixWrappersWhitelistProcess = [ "sshd" "systemd" "sudo" "su" ];
+      # Add custom audit rules for sensitive files
+      rules = [
+        "-w /etc/passwd -p wa -k identity"
+        "-w /etc/shadow -p wa -k identity"
+        "-w /etc/group -p wa -k identity"
+        "-w /etc/sudoers -p wa -k sudoers"
+      ];
     };
   };
 }

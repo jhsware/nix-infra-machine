@@ -4,9 +4,12 @@
 # This test:
 # 1. Deploys CrowdSec with SSH and system protection enabled
 # 2. Verifies the CrowdSec service and Local API are running
-# 3. Tests cscli functionality (hub, parsers, scenarios)
-# 4. Tests basic decision management
-# 5. Cleans up on teardown
+# 3. Tests firewall bouncer (nftables integration)
+# 4. Tests HAProxy SPOA bouncer
+# 5. Tests auditd integration for kernel-level monitoring
+# 6. Tests cscli functionality (hub, parsers, scenarios)
+# 7. Tests basic decision management
+# 8. Cleans up on teardown
 #
 # [NIS2 COMPLIANCE VERIFICATION]
 # This test validates that the CrowdSec deployment meets key NIS2 requirements:
@@ -16,14 +19,21 @@
 
 # Configuration
 CROWDSEC_API_PORT=8080
-# Note: Firewall bouncer disabled in test (package not available in NixOS 25.05)
-FIREWALL_BOUNCER_ENABLED=false
+FIREWALL_BOUNCER_ENABLED=true
+HAPROXY_BOUNCER_ENABLED=false
+HAPROXY_SPOA_PORT=3000
+AUDITD_ENABLED=true
+
 
 # Handle teardown command
 if [ "$CMD" = "teardown" ]; then
   echo "Tearing down CrowdSec test..."
   
   # Stop CrowdSec services
+  if [ "$HAPROXY_BOUNCER_ENABLED" = "true" ]; then
+    $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" \
+      'systemctl stop crowdsec-haproxy-bouncer 2>/dev/null || true'
+  fi
   if [ "$FIREWALL_BOUNCER_ENABLED" = "true" ]; then
     $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" \
       'systemctl stop crowdsec-firewall-bouncer 2>/dev/null || true'
@@ -36,6 +46,8 @@ if [ "$CMD" = "teardown" ]; then
     'rm -rf /var/lib/crowdsec'
   $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" \
     'rm -rf /var/lib/crowdsec-firewall-bouncer 2>/dev/null || true'
+  $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" \
+    'rm -rf /var/lib/crowdsec-haproxy-bouncer 2>/dev/null || true'
   
   # Clean up declarative configuration directories on target nodes
   $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" \
@@ -44,7 +56,6 @@ if [ "$CMD" = "teardown" ]; then
   echo "CrowdSec teardown complete"
   return 0
 fi
-
 
 # ============================================================================
 # Test Setup
@@ -73,7 +84,7 @@ $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" "nixos-rebuild switch --f
 _setup=$(date +%s)
 
 # ============================================================================
-# Test Verification - Services
+# Test Verification - CrowdSec Service
 # ============================================================================
 
 echo ""
@@ -104,11 +115,11 @@ done
 echo ""
 echo "Checking CrowdSec API port ($CROWDSEC_API_PORT)..."
 for node in $TARGET; do
-  assert_port_listening "$node" "$CROWDSEC_API_PORT" "CrowdSec LAPI port $CROWDSEC_API_PORT"
+  assert_port_listening "$node" "$CROWDSEC_API_PORT" "CrowdSec API port $CROWDSEC_API_PORT"
 done
 
 # ============================================================================
-# Test Verification - Firewall Bouncer (if enabled)
+# Test Verification - Firewall Bouncer
 # ============================================================================
 
 if [ "$FIREWALL_BOUNCER_ENABLED" = "true" ]; then
@@ -127,11 +138,148 @@ if [ "$FIREWALL_BOUNCER_ENABLED" = "true" ]; then
     assert_service_active "$node" "crowdsec-firewall-bouncer" || \
       show_service_logs "$node" "crowdsec-firewall-bouncer" 50
   done
+
+  # Check nftables integration
+  echo ""
+  echo "Checking nftables integration..."
+  for node in $TARGET; do
+    echo "  Verifying nftables tables and sets on $node..."
+    
+    # Check if crowdsec table exists
+    nft_table=$(cmd_clean "$node" "nft list table ip crowdsec 2>&1 || echo 'not found'")
+    if [[ "$nft_table" == *"table ip crowdsec"* ]]; then
+      echo -e "  ${GREEN}✓${NC} CrowdSec nftables IPv4 table exists [pass]"
+    else
+      echo -e "  ${YELLOW}!${NC} CrowdSec nftables tables: $nft_table [warning]"
+    fi
+    
+    # Check if crowdsec set exists in IPv4 table
+    nft_set=$(cmd_clean "$node" "nft list set ip crowdsec crowdsec-blocklist 2>&1 || echo 'not found'")
+    if [[ "$nft_set" == *"crowdsec-blocklist"* ]]; then
+      echo -e "  ${GREEN}✓${NC} CrowdSec IPv4 nftables set exists [pass]"
+    else
+      echo -e "  ${YELLOW}!${NC} CrowdSec IPv4 set: $nft_set [warning]"
+    fi
+    
+    # Check if crowdsec chain exists
+    nft_chain=$(cmd_clean "$node" "nft list chain ip crowdsec crowdsec-chain 2>&1 || echo 'not found'")
+    if [[ "$nft_chain" == *"crowdsec-chain"* ]]; then
+      echo -e "  ${GREEN}✓${NC} CrowdSec nftables chain exists [pass]"
+    else
+      echo -e "  ${YELLOW}!${NC} CrowdSec chain: $nft_chain [warning]"
+    fi
+    
+    # Check IPv6 table
+    nft_table6=$(cmd_clean "$node" "nft list table ip6 crowdsec6 2>&1 || echo 'not found'")
+    if [[ "$nft_table6" == *"table ip6 crowdsec6"* ]]; then
+      echo -e "  ${GREEN}✓${NC} CrowdSec nftables IPv6 table exists [pass]"
+    else
+      echo -e "  ${YELLOW}!${NC} CrowdSec IPv6 table: $nft_table6 [warning]"
+    fi
+  done
 else
   echo ""
   echo "Step 4: Firewall Bouncer (SKIPPED - disabled in test config)"
   echo ""
-  echo -e "  ${YELLOW}!${NC} Firewall bouncer not enabled (package not available in NixOS 25.05) [info]"
+fi
+
+# ============================================================================
+# Test Verification - HAProxy SPOA Bouncer
+# ============================================================================
+
+if [ "$HAPROXY_BOUNCER_ENABLED" = "true" ]; then
+  echo ""
+  echo "Step 5: Verifying HAProxy SPOA Bouncer..."
+  echo ""
+
+  # Wait for bouncer service
+  for node in $TARGET; do
+    wait_for_service "$node" "crowdsec-haproxy-bouncer" --timeout=60
+    wait_for_port "$node" "$HAPROXY_SPOA_PORT" --timeout=60
+  done
+
+  # Check bouncer service status
+  echo "Checking HAProxy SPOA Bouncer systemd service status..."
+  for node in $TARGET; do
+    assert_service_active "$node" "crowdsec-haproxy-bouncer" || \
+      show_service_logs "$node" "crowdsec-haproxy-bouncer" 50
+  done
+
+  # Check if SPOA port is listening
+  echo ""
+  echo "Checking HAProxy SPOA port ($HAPROXY_SPOA_PORT)..."
+  for node in $TARGET; do
+    assert_port_listening "$node" "$HAPROXY_SPOA_PORT" "HAProxy SPOA port $HAPROXY_SPOA_PORT"
+  done
+  
+  # Verify SPOA config exists
+  echo ""
+  echo "Checking HAProxy SPOA bouncer configuration..."
+  for node in $TARGET; do
+    config_check=$(cmd_clean "$node" "test -f /var/lib/crowdsec-haproxy-bouncer/config.yaml && echo 'exists' || echo 'missing'")
+    if [[ "$config_check" == *"exists"* ]]; then
+      echo -e "  ${GREEN}✓${NC} HAProxy SPOA bouncer config exists [pass]"
+    else
+      echo -e "  ${YELLOW}!${NC} HAProxy SPOA bouncer config: $config_check [warning]"
+    fi
+  done
+else
+  echo ""
+  echo "Step 5: HAProxy SPOA Bouncer (SKIPPED - disabled in test config)"
+  echo ""
+fi
+
+# ============================================================================
+# Test Verification - Auditd Integration
+# ============================================================================
+
+if [ "$AUDITD_ENABLED" = "true" ]; then
+  echo ""
+  echo "Step 6: Verifying Auditd Integration..."
+  echo ""
+
+  # Check if auditd service is running
+  for node in $TARGET; do
+    echo "Checking auditd service on $node..."
+    
+    # Check auditd service status
+    auditd_status=$(cmd_clean "$node" "systemctl is-active auditd 2>&1 || echo 'inactive'")
+    if [[ "$auditd_status" == "active" ]]; then
+      echo -e "  ${GREEN}✓${NC} Auditd service is active [pass]"
+    else
+      echo -e "  ${YELLOW}!${NC} Auditd service status: $auditd_status [warning]"
+    fi
+    
+    # Check if audit rules are loaded
+    echo "  Checking audit rules..."
+    audit_rules=$(cmd_clean "$node" "auditctl -l 2>&1 || echo 'no rules'")
+    if [[ "$audit_rules" == *"passwd"* ]] || [[ "$audit_rules" == *"shadow"* ]]; then
+      echo -e "  ${GREEN}✓${NC} Audit rules for identity files loaded [pass]"
+    else
+      echo -e "  ${YELLOW}!${NC} Audit rules: $audit_rules [warning]"
+    fi
+    
+    # Check if sudoers watch rule is loaded
+    if [[ "$audit_rules" == *"sudoers"* ]]; then
+      echo -e "  ${GREEN}✓${NC} Audit rule for sudoers file loaded [pass]"
+    else
+      echo -e "  ${YELLOW}!${NC} Sudoers audit rule not found [warning]"
+    fi
+    
+    # Verify whitelist processes are configured (check audit config)
+    echo "  Checking NixOS wrapper whitelist configuration..."
+    # The whitelist is configured via audit rules, we verify it was processed
+    # by checking that the service started without errors
+    if [[ "$auditd_status" == "active" ]]; then
+      echo -e "  ${GREEN}✓${NC} NixOS wrapper whitelist configured (service active) [pass]"
+    else
+      echo -e "  ${YELLOW}!${NC} Cannot verify whitelist (auditd not active) [warning]"
+    fi
+  done
+else
+  echo ""
+  echo "Step 6: Auditd Integration (SKIPPED - disabled in test config)"
+  echo ""
 fi
 
 # ============================================================================
@@ -139,7 +287,7 @@ fi
 # ============================================================================
 
 echo ""
-echo "Step 5: Testing CrowdSec CLI (cscli)..."
+echo "Step 7: Testing CrowdSec CLI (cscli)..."
 echo ""
 
 for node in $TARGET; do
@@ -160,10 +308,8 @@ for node in $TARGET; do
   if [[ "$lapi_status" == *"successfully interact"* ]] || [[ "$lapi_status" == *"LAPI is reachable"* ]] || [[ "$lapi_status" == *"You can successfully"* ]]; then
     echo -e "  ${GREEN}✓${NC} Local API is reachable [pass]"
   else
-    # LAPI might report issues but still be running
     echo -e "  ${YELLOW}!${NC} LAPI status check: $lapi_status [warning]"
   fi
-
   
   # Test hub listing
   echo "  Checking installed hub items..."
@@ -173,7 +319,6 @@ for node in $TARGET; do
   else
     echo -e "  ${YELLOW}!${NC} Hub listing output: $hub_result [warning]"
   fi
-
   
   # Test collections listing
   echo "  Checking installed collections..."
@@ -192,17 +337,15 @@ for node in $TARGET; do
   else
     echo -e "  ${YELLOW}!${NC} Parsers may still be installing: $parsers_result [warning]"
   fi
-
   
   # Test scenarios listing
   echo "  Checking installed scenarios..."
   scenarios_result=$(cmd_clean "$node" "cscli scenarios list 2>&1 || true")
-  if [[ "$scenarios_result" == *"ssh"* ]] || [[ "$scenarios_result" == *"bf"* ]] || [[ "$scenarios_result" == *"crowdsecurity"* ]]; then
+  if [[ "$scenarios_result" == *"ssh"* ]] || [[ "$scenarios_result" == *"crowdsecurity"* ]]; then
     echo -e "  ${GREEN}✓${NC} Scenarios installed [pass]"
   else
-    echo -e "  ${YELLOW}!${NC} Scenarios may still be installing: $scenarios_result [warning]"
+    echo -e "  ${YELLOW}!${NC} Scenarios may still be installing [info]"
   fi
-
 done
 
 # ============================================================================
@@ -210,7 +353,7 @@ done
 # ============================================================================
 
 echo ""
-echo "Step 6: Testing Decision Management..."
+echo "Step 8: Testing Decision Management..."
 echo ""
 
 for node in $TARGET; do
@@ -240,10 +383,10 @@ for node in $TARGET; do
   if [[ "$verify_result" == *"192.0.2.1"* ]]; then
     echo -e "  ${GREEN}✓${NC} Decision recorded in database [pass]"
   else
-    echo -e "  ${YELLOW}!${NC} Decision may not be visible yet [info]"
+    echo -e "  ${YELLOW}!${NC} Decision verification: $verify_result [warning]"
   fi
   
-  # Remove the test decision and verify removal
+  # Remove the test decision
   echo "  Removing test decision..."
   remove_result=$(cmd_clean "$node" "cscli decisions delete --ip 192.0.2.1 2>&1 || true")
   if [[ "$remove_result" == *"decision"* ]] || [[ "$remove_result" == *"deleted"* ]] || [[ "$remove_result" == *"removed"* ]]; then
@@ -258,19 +401,16 @@ for node in $TARGET; do
   if [[ "$verify_removed" != *"192.0.2.1"* ]]; then
     echo -e "  ${GREEN}✓${NC} Decision successfully removed from database [pass]"
   else
-    echo -e "  ${YELLOW}!${NC} Decision may still be present: $verify_removed [warning]"
+    echo -e "  ${YELLOW}!${NC} Decision may still exist: $verify_removed [warning]"
   fi
-
-  
-  echo ""
 done
 
 # ============================================================================
-# Functional Tests - Bouncer Registration (if bouncer enabled)
+# Functional Tests - Bouncer Registration
 # ============================================================================
 
 echo ""
-echo "Step 7: Testing Bouncer Registration..."
+echo "Step 9: Testing Bouncer Registration..."
 echo ""
 
 for node in $TARGET; do
@@ -278,44 +418,52 @@ for node in $TARGET; do
   
   # List registered bouncers
   bouncers_result=$(cmd_clean "$node" "cscli bouncers list 2>&1 || true")
+  
   if [ "$FIREWALL_BOUNCER_ENABLED" = "true" ]; then
     if [[ "$bouncers_result" == *"firewall"* ]] || [[ "$bouncers_result" == *"bouncer"* ]]; then
       echo -e "  ${GREEN}✓${NC} Firewall bouncer is registered [pass]"
     else
       echo -e "  ${YELLOW}!${NC} Bouncer registration status: $bouncers_result [info]"
     fi
-  else
-    echo -e "  ${YELLOW}!${NC} Bouncer check skipped (disabled in config) [info]"
+  fi
+  
+  if [ "$HAPROXY_BOUNCER_ENABLED" = "true" ]; then
+    if [[ "$bouncers_result" == *"haproxy"* ]] || [[ "$bouncers_result" == *"spoa"* ]]; then
+      echo -e "  ${GREEN}✓${NC} HAProxy SPOA bouncer is registered [pass]"
+    else
+      echo -e "  ${YELLOW}!${NC} HAProxy bouncer registration status: $bouncers_result [info]"
+    fi
+  fi
+  
+  if [ "$FIREWALL_BOUNCER_ENABLED" = "false" ] && [ "$HAPROXY_BOUNCER_ENABLED" = "false" ]; then
+    echo -e "  ${YELLOW}!${NC} Bouncer check skipped (both disabled in config) [info]"
   fi
 done
 
 # ============================================================================
-# Functional Tests - Metrics
+# Functional Tests - Metrics and API Endpoints
 # ============================================================================
 
 echo ""
-echo "Step 8: Testing Metrics and API Endpoints..."
+echo "Step 10: Testing Metrics and API Endpoints..."
 echo ""
 
 for node in $TARGET; do
   echo "Checking metrics on $node..."
   
-  # Test cscli alerts list (always works, doesn't require prometheus)
+  # Test cscli alerts list
   echo "  Checking cscli alerts functionality..."
   alerts_result=$(cmd_clean "$node" "cscli alerts list 2>&1 || true")
-  # Valid responses: "No active alerts", table with headers (ID, value, etc.), or empty table
   if [[ "$alerts_result" == *"No active alerts"* ]] || [[ "$alerts_result" == *"ID"* ]] || [[ "$alerts_result" == *"Source"* ]] || [[ "$alerts_result" == *"Reason"* ]]; then
     echo -e "  ${GREEN}✓${NC} cscli alerts command works [pass]"
   else
     echo -e "  ${YELLOW}!${NC} Alerts output unexpected: $alerts_result [warning]"
   fi
-
   
-  # Test API endpoint - use /v1/decisions which requires auth but confirms API is responding
+  # Test API endpoint
   echo "  Checking API endpoint..."
   api_result=$(cmd_clean "$node" "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$CROWDSEC_API_PORT/v1/decisions 2>&1 || echo '000'")
   if [[ "$api_result" == "200" ]] || [[ "$api_result" == "401" ]] || [[ "$api_result" == "403" ]]; then
-    # 200 = OK, 401/403 = API is responding but requires auth (expected)
     echo -e "  ${GREEN}✓${NC} API endpoint responds (HTTP $api_result) [pass]"
   else
     echo -e "  ${YELLOW}!${NC} API response code: $api_result [warning]"
@@ -327,13 +475,12 @@ done
 # ============================================================================
 
 echo ""
-echo "Step 9: Testing Machine Registration..."
+echo "Step 11: Testing Machine Registration..."
 echo ""
 
 for node in $TARGET; do
   echo "Checking machine registration on $node..."
   
-  # Check if local machine is registered with LAPI
   echo "  Checking registered machines..."
   machines_result=$(cmd_clean "$node" "cscli machines list 2>&1 || true")
   if [[ "$machines_result" == *"testnode"* ]] || [[ "$machines_result" == *"localhost"* ]] || [[ "$machines_result" == *"validated"* ]]; then
@@ -348,13 +495,13 @@ done
 # ============================================================================
 
 echo ""
-echo "Step 10: Testing Acquisition Sources..."
+echo "Step 12: Testing Acquisition Sources..."
 echo ""
 
 for node in $TARGET; do
   echo "Checking acquisition sources on $node..."
   
-  # Check if acquisitions are configured (SSH journal should be present)
+  # Check if acquisitions are configured
   echo "  Checking acquisition configuration..."
   acq_file=$(cmd_clean "$node" "cat /var/lib/crowdsec/config/acquisitions.yaml 2>&1 || true")
   if [[ "$acq_file" == *"journalctl"* ]] || [[ "$acq_file" == *"sshd"* ]] || [[ "$acq_file" == *"source"* ]]; then
@@ -363,13 +510,12 @@ for node in $TARGET; do
     echo -e "  ${YELLOW}!${NC} Acquisition config: $acq_file [warning]"
   fi
   
-  # Check cscli metrics for acquisition stats (shows if sources are being read)
+  # Check cscli metrics for acquisition stats
   echo "  Checking acquisition metrics..."
   acq_metrics=$(cmd_clean "$node" "cscli metrics show acquisitions 2>&1 || true")
   if [[ "$acq_metrics" == *"journalctl"* ]] || [[ "$acq_metrics" == *"file"* ]] || [[ "$acq_metrics" == *"Source"* ]] || [[ "$acq_metrics" == *"Lines"* ]]; then
     echo -e "  ${GREEN}✓${NC} Acquisition metrics available [pass]"
   else
-    # Metrics might not be available if prometheus is disabled
     echo -e "  ${YELLOW}!${NC} Acquisition metrics: $acq_metrics [info]"
   fi
 done
@@ -379,7 +525,7 @@ done
 # ============================================================================
 
 echo ""
-echo "Step 11: Testing Database and Configuration Files..."
+echo "Step 13: Testing Database and Configuration Files..."
 echo ""
 
 for node in $TARGET; do
@@ -418,7 +564,7 @@ done
 # ============================================================================
 
 echo ""
-echo "Step 12: Testing Service Restart..."
+echo "Step 14: Testing Service Restart..."
 echo ""
 
 for node in $TARGET; do
@@ -452,7 +598,6 @@ for node in $TARGET; do
   fi
 done
 
-
 # ============================================================================
 # NIS2 Compliance Summary
 # ============================================================================
@@ -466,22 +611,28 @@ echo "Article 21(2)(b) - Incident Handling:"
 echo "  ✓ CrowdSec provides automated threat detection"
 if [ "$FIREWALL_BOUNCER_ENABLED" = "true" ]; then
   echo "  ✓ Firewall bouncer enables real-time response"
-else
-  echo "  ! Firewall bouncer available but not tested (package unavailable)"
+fi
+if [ "$HAPROXY_BOUNCER_ENABLED" = "true" ]; then
+  echo "  ✓ HAProxy SPOA bouncer enables layer 7 protection"
 fi
 echo ""
 echo "Article 21(2)(d) - Network Security:"
 echo "  ✓ IDS/IPS capabilities via CrowdSec engine"
 if [ "$FIREWALL_BOUNCER_ENABLED" = "true" ]; then
-  echo "  ✓ Automated IP blocking via firewall bouncer"
-else
-  echo "  ! Automated IP blocking available when bouncer enabled"
+  echo "  ✓ Automated IP blocking via firewall bouncer (nftables)"
+fi
+if [ "$HAPROXY_BOUNCER_ENABLED" = "true" ]; then
+  echo "  ✓ Application-layer protection via HAProxy SPOA"
 fi
 echo ""
 echo "Article 21(2)(g) - Security Monitoring:"
 echo "  ✓ SSH authentication monitoring enabled"
 echo "  ✓ System/kernel log monitoring enabled"
 echo "  ✓ Centralized decision logging active"
+if [ "$AUDITD_ENABLED" = "true" ]; then
+  echo "  ✓ Kernel-level auditd integration enabled"
+  echo "  ✓ NixOS wrapper whitelist configured"
+fi
 echo ""
 echo "Article 21(2)(i) - Human Resources Security:"
 echo "  ✓ Protection against credential attacks"

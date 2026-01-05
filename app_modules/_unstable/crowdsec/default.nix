@@ -213,6 +213,27 @@ in
         default = false;
       };
 
+      haproxyProtection = lib.mkOption {
+        type = lib.types.bool;
+        description = ''
+          Enable HAProxy security integration via SPOA (Stream Processing Offload API).
+          
+          The cs-haproxy-spoa-bouncer acts as a stream processing agent that checks
+          each connection in real-time against CrowdSec's decision database before
+          allowing traffic to reach your application servers.
+          
+          This provides layer 7 application-level protection, complementing the
+          layer 3/4 protection from the firewall bouncer.
+          
+          [NIS2 COMPLIANCE]
+          Article 21(2)(d) - Network Security: Provides application-layer protection
+          for HTTP/HTTPS traffic through HAProxy integration.
+          
+          Article 21(2)(e) - Supply Chain Security: Protects web applications that
+          may be part of the digital supply chain.
+        '';
+        default = false;
+      };
 
       communityBlocklists = lib.mkOption {
         type = lib.types.bool;
@@ -377,7 +398,6 @@ in
         example = lib.literalExpression "pkgs.crowdsec-firewall-bouncer";
       };
 
-
       mode = lib.mkOption {
         type = lib.types.enum [ "iptables" "nftables" "ipset" ];
         description = ''
@@ -463,6 +483,120 @@ in
       };
     };
 
+    # ==========================================================================
+    # HAProxy SPOA Bouncer Configuration
+    # ==========================================================================
+
+    haproxy = {
+      package = lib.mkOption {
+        type = lib.types.nullOr lib.types.package;
+        description = ''
+          CrowdSec HAProxy SPOA bouncer package to use.
+          
+          The package should be available as pkgs.cs-haproxy-spoa-bouncer.
+          Set to null to disable the bouncer even when features.haproxyProtection
+          is enabled.
+        '';
+        default = pkgs.cs-haproxy-spoa-bouncer or null;
+        defaultText = lib.literalExpression "pkgs.cs-haproxy-spoa-bouncer";
+        example = lib.literalExpression "pkgs.cs-haproxy-spoa-bouncer";
+      };
+
+      listenAddr = lib.mkOption {
+        type = lib.types.str;
+        description = ''
+          Address for the SPOA bouncer to listen on.
+          HAProxy will connect to this address to check decisions.
+        '';
+        default = "127.0.0.1";
+        example = "0.0.0.0";
+      };
+
+      listenPort = lib.mkOption {
+        type = lib.types.port;
+        description = "Port for the SPOA bouncer to listen on.";
+        default = 3000;
+        example = 3000;
+      };
+
+      action = lib.mkOption {
+        type = lib.types.enum [ "deny" "tarpit" ];
+        description = ''
+          Action to take for blocked requests in HAProxy.
+          
+          - "deny": Immediately reject the connection
+          - "tarpit": Slow down the connection (tar pit)
+        '';
+        default = "deny";
+      };
+
+      logLevel = lib.mkOption {
+        type = lib.types.enum [ "error" "warning" "info" "debug" ];
+        description = "Log level for the SPOA bouncer.";
+        default = "info";
+      };
+    };
+
+    # ==========================================================================
+    # Auditd Integration
+    # ==========================================================================
+
+    auditd = {
+      nixWrappersWhitelistProcess = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        description = ''
+          List of process names to whitelist from auditd monitoring when
+          they execute NixOS wrapper scripts.
+          
+          NixOS uses wrapper scripts in /run/wrappers/bin for setuid/setgid
+          programs (like sudo, ping, etc.). These wrappers can generate a lot
+          of noise in auditd logs. This option allows you to whitelist specific
+          processes that legitimately use these wrappers.
+          
+          The whitelist is applied to auditd rules that monitor execve calls
+          on wrapper binaries.
+          
+          [NIS2 COMPLIANCE]
+          Article 21(2)(g) - Security Monitoring: Reduces audit log noise
+          while maintaining security visibility on critical processes.
+        '';
+        default = [];
+        example = [ "sshd" "systemd" "sudo" ];
+      };
+
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        description = ''
+          Enable auditd integration with CrowdSec.
+          
+          When enabled, configures auditd to send audit events to CrowdSec
+          for analysis. This enables detection of:
+          - Privilege escalation attempts
+          - Unauthorized file access
+          - System call anomalies
+          - User authentication events
+          
+          [NIS2 COMPLIANCE]
+          Article 21(2)(g) - Security Monitoring: Provides kernel-level
+          visibility into security events and potential threats.
+        '';
+        default = false;
+      };
+
+      rules = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        description = ''
+          Additional auditd rules to configure for CrowdSec monitoring.
+          
+          These rules are added to the system's auditd configuration.
+        '';
+        default = [];
+        example = [
+          "-w /etc/passwd -p wa -k identity"
+          "-w /etc/shadow -p wa -k identity"
+        ];
+      };
+    };
 
     # ==========================================================================
     # Pass-through Configuration
@@ -801,18 +935,84 @@ in
           fi
         fi
         
-        # Read existing key if registration failed
+        # Read existing key
         if [ -f "$KEY_FILE" ]; then
           export BOUNCER_API_KEY=$(cat "$KEY_FILE")
         fi
         
         # Generate config with key substituted
+        # Use | as sed delimiter since API keys may contain /
         if [ -n "$BOUNCER_API_KEY" ]; then
-          sed "s/\''${BOUNCER_API_KEY}/$BOUNCER_API_KEY/g" ${bouncerConfigFile} > /var/lib/crowdsec-firewall-bouncer/config.yaml
+          sed "s|\''${BOUNCER_API_KEY}|$BOUNCER_API_KEY|g" ${bouncerConfigFile} > /var/lib/crowdsec-firewall-bouncer/config.yaml
         fi
       '';
 
+      # ========================================================================
+      # HAProxy SPOA Bouncer Configuration
+      # ========================================================================
+      haproxyBouncerEnabled = cfg.features.haproxyProtection && cfg.haproxy.package != null;
+      
+      # HAProxy SPOA bouncer config file
+      haproxyBouncerConfigFile = yamlFormat.generate "crowdsec-haproxy-spoa-bouncer.yaml" {
+        lapi_url = "http://${cfg.api.listenAddr}:${toString cfg.api.listenPort}";
+        lapi_key = "\${HAPROXY_SPOA_API_KEY}";
+        action = cfg.haproxy.action;
+        log_level = cfg.haproxy.logLevel;
+        listen_addr = cfg.haproxy.listenAddr;
+        listen_port = cfg.haproxy.listenPort;
+        update_frequency = "10s";
+      };
+
+      haproxyBouncerRegisterScript = pkgs.writeShellScript "crowdsec-haproxy-bouncer-register" ''
+        set -e
+        export PATH="${lib.makeBinPath [ cfg.package pkgs.coreutils pkgs.gnugrep pkgs.gnused ]}:$PATH"
+        
+        CONFIG_DIR="${stateDir}/config"
+        KEY_FILE="/var/lib/crowdsec-haproxy-bouncer/api_key"
+        
+        # Wait for CrowdSec API to be ready
+        for i in $(seq 1 60); do
+          if cscli -c "$CONFIG_DIR/config.yaml" bouncers list >/dev/null 2>&1; then
+            break
+          fi
+          sleep 1
+        done
+        
+        # Check if bouncer already registered
+        if ! cscli -c "$CONFIG_DIR/config.yaml" bouncers list 2>/dev/null | grep -q "haproxy-spoa-bouncer"; then
+          # Register new bouncer and save key
+          KEY=$(cscli -c "$CONFIG_DIR/config.yaml" bouncers add haproxy-spoa-bouncer -o raw 2>/dev/null || echo "")
+          if [ -n "$KEY" ]; then
+            echo "$KEY" > "$KEY_FILE"
+            chmod 600 "$KEY_FILE"
+          fi
+        fi
+        
+        # Read existing key
+        if [ -f "$KEY_FILE" ]; then
+          export HAPROXY_SPOA_API_KEY=$(cat "$KEY_FILE")
+        fi
+        
+        # Generate config with key substituted
+        # Use | as sed delimiter since API keys may contain /
+        if [ -n "$HAPROXY_SPOA_API_KEY" ]; then
+          sed "s|\''${HAPROXY_SPOA_API_KEY}|$HAPROXY_SPOA_API_KEY|g" ${haproxyBouncerConfigFile} > /var/lib/crowdsec-haproxy-bouncer/config.yaml
+        fi
+      '';
+      # ========================================================================
+      # Auditd Configuration
+      # ========================================================================
+      auditdEnabled = cfg.auditd.enable;
+      
+      # Generate auditd whitelist rules for NixOS wrappers
+      # Note: auditd's exe filter doesn't support wildcards, so we use comm only
+      # This whitelists by process name which is sufficient for reducing noise
+      auditdWhitelistRules = lib.concatMapStringsSep "\n" (proc:
+        "-a never,exit -F arch=b64 -S execve -F comm=${proc}"
+      ) cfg.auditd.nixWrappersWhitelistProcess;
+
     in lib.mkMerge [
+
       # ==========================================================================
       # Common Configuration (both implementations)
       # ==========================================================================
@@ -832,7 +1032,18 @@ in
               3. Provide the package from an external source
             '';
           }
-
+          {
+            assertion = !cfg.features.haproxyProtection || cfg.haproxy.package != null;
+            message = ''
+              CrowdSec HAProxy SPOA bouncer is enabled but no package is configured.
+              
+              The bouncer package should be available as pkgs.cs-haproxy-spoa-bouncer.
+              If the package is not available, you may need to:
+              
+              1. Set infrastructure.crowdsec.features.haproxyProtection = false
+              2. Provide the package from an external source
+            '';
+          }
           {
             assertion = acquisitions != [];
             message = ''
@@ -923,6 +1134,22 @@ in
       })
 
       # ==========================================================================
+      # Auditd Integration
+      # ==========================================================================
+      (lib.mkIf auditdEnabled {
+        security.auditd.enable = true;
+        
+        # Add user-defined rules plus whitelist rules for NixOS wrapper processes
+        # Note: auditd's exe filter doesn't support wildcards, so we use comm only
+        # This whitelists by process name which is sufficient for reducing noise
+        security.audit.rules = cfg.auditd.rules ++ (lib.optionals (cfg.auditd.nixWrappersWhitelistProcess != []) (
+          map (proc:
+            "-a never,exit -F arch=b64 -S execve -F comm=${proc}"
+          ) cfg.auditd.nixWrappersWhitelistProcess
+        ));
+      })
+
+      # ==========================================================================
       # Custom Implementation
       # ==========================================================================
       (lib.mkIf (!useNativeImplementation) {
@@ -942,10 +1169,11 @@ in
           "d ${stateDir}/data 0755 crowdsec crowdsec - -"
           "d ${stateDir}/hub 0755 crowdsec crowdsec - -"
           # Create /etc/crowdsec directory and symlink for cscli default config path
-          "d /etc/crowdsec 0755 root root - -"
           "L+ /etc/crowdsec/config.yaml - - - - ${stateDir}/config/config.yaml"
         ] ++ lib.optionals bouncerEnabled [
           "d /var/lib/crowdsec-firewall-bouncer 0750 root root - -"
+        ] ++ lib.optionals haproxyBouncerEnabled [
+          "d /var/lib/crowdsec-haproxy-bouncer 0750 root root - -"
         ];
 
         # Main CrowdSec service
@@ -979,18 +1207,33 @@ in
         };
 
         # Firewall bouncer service (only when package is available)
+        # Note: The binary is named cs-firewall-bouncer (from the Go module name)
         systemd.services.crowdsec-firewall-bouncer = lib.mkIf bouncerEnabled {
           description = "CrowdSec Firewall Bouncer";
           wantedBy = [ "multi-user.target" ];
           after = [ "network.target" "crowdsec.service" ];
           requires = [ "crowdsec.service" ];
-
-          path = [ pkgs.iptables pkgs.ipset ];
-
+          
           serviceConfig = {
             Type = "simple";
             ExecStartPre = "${bouncerRegisterScript}";
-            ExecStart = "${cfg.bouncer.package}/bin/crowdsec-firewall-bouncer -c /var/lib/crowdsec-firewall-bouncer/config.yaml";
+            ExecStart = "${cfg.bouncer.package}/bin/cs-firewall-bouncer -c /var/lib/crowdsec-firewall-bouncer/config.yaml";
+            Restart = "always";
+            RestartSec = "10s";
+          };
+        };
+
+        # HAProxy SPOA bouncer service (only when package is available)
+        systemd.services.crowdsec-haproxy-bouncer = lib.mkIf haproxyBouncerEnabled {
+          description = "CrowdSec HAProxy SPOA Bouncer";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "network.target" "crowdsec.service" ];
+          requires = [ "crowdsec.service" ];
+
+          serviceConfig = {
+            Type = "simple";
+            ExecStartPre = "${haproxyBouncerRegisterScript}";
+            ExecStart = "${cfg.haproxy.package}/bin/cs-haproxy-spoa-bouncer -c /var/lib/crowdsec-haproxy-bouncer/config.yaml";
             Restart = "always";
             RestartSec = "10s";
           };
@@ -1004,12 +1247,12 @@ in
         # Workarounds for native module bugs
         systemd.tmpfiles.rules = [
           # WORKAROUND #445342: Create state directory
-          "d /var/lib/crowdsec 0755 crowdsec crowdsec - -"
-          
           # WORKAROUND #446764: Create online_api_credentials.yaml
           "f /var/lib/crowdsec/online_api_credentials.yaml 0640 crowdsec crowdsec - -"
         ] ++ lib.optionals bouncerEnabled [
           "d /var/lib/crowdsec-firewall-bouncer 0750 root root - -"
+        ] ++ lib.optionals haproxyBouncerEnabled [
+          "d /var/lib/crowdsec-haproxy-bouncer 0750 root root - -"
         ];
 
         services.crowdsec = {
@@ -1044,6 +1287,7 @@ in
         };
 
         # Firewall bouncer service (custom - not yet in native nixpkgs)
+        # Note: The binary is named cs-firewall-bouncer (from the Go module name)
         systemd.services.crowdsec-firewall-bouncer = lib.mkIf bouncerEnabled {
           description = "CrowdSec Firewall Bouncer";
           wantedBy = [ "multi-user.target" ];
@@ -1051,11 +1295,26 @@ in
           requires = [ "crowdsec.service" ];
 
           path = [ pkgs.iptables pkgs.ipset ];
-
           serviceConfig = {
             Type = "simple";
             ExecStartPre = "${bouncerRegisterScript}";
-            ExecStart = "${cfg.bouncer.package}/bin/crowdsec-firewall-bouncer -c /var/lib/crowdsec-firewall-bouncer/config.yaml";
+            ExecStart = "${cfg.bouncer.package}/bin/cs-firewall-bouncer -c /var/lib/crowdsec-firewall-bouncer/config.yaml";
+            Restart = "always";
+            RestartSec = "10s";
+          };
+        };
+
+        # HAProxy SPOA bouncer service (custom - not yet in native nixpkgs)
+        systemd.services.crowdsec-haproxy-bouncer = lib.mkIf haproxyBouncerEnabled {
+          description = "CrowdSec HAProxy SPOA Bouncer";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "network.target" "crowdsec.service" ];
+          requires = [ "crowdsec.service" ];
+
+          serviceConfig = {
+            Type = "simple";
+            ExecStartPre = "${haproxyBouncerRegisterScript}";
+            ExecStart = "${cfg.haproxy.package}/bin/cs-haproxy-spoa-bouncer -c /var/lib/crowdsec-haproxy-bouncer/config.yaml";
             Restart = "always";
             RestartSec = "10s";
           };
