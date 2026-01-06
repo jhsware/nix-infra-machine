@@ -20,6 +20,10 @@ if [ "$CMD" = "teardown" ]; then
     'systemctl stop beiwe-backend 2>/dev/null || true'
   $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" \
     'systemctl stop minio 2>/dev/null || true'
+  $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" \
+    'systemctl stop postgresql 2>/dev/null || true'
+  $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" \
+    'systemctl stop rabbitmq 2>/dev/null || true'
     
   # Clean up data directories
   echo "  Removing beiwe-backend data directory..."
@@ -30,12 +34,13 @@ if [ "$CMD" = "teardown" ]; then
   $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" \
     'rm -rf /var/lib/minio'
   
-  # Drop database
-  echo "  Dropping beiwe database..."
+  echo "  Removing PostgreSQL data directory..."
   $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" \
-    'sudo -u postgres psql -c "DROP DATABASE IF EXISTS beiwe" 2>/dev/null || true'
+    'rm -rf /var/lib/postgresql'
+  
+  echo "  Removing RabbitMQ data directory..."
   $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" \
-    'sudo -u postgres psql -c "DROP USER IF EXISTS beiwe" 2>/dev/null || true'
+    'rm -rf /var/lib/rabbitmq'
     
   echo "beiwe-backend teardown complete"
   return 0
