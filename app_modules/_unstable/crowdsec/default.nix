@@ -3,7 +3,10 @@
 # This module provides simplified boolean feature toggles for common use cases
 # and can use either a custom implementation or the native NixOS module.
 #
-# Bouncer modules are imported separately from ./bouncers/
+# Module structure:
+# - default.nix: Core CrowdSec engine and detection features
+# - bouncers/: Response modules (firewall, haproxy, python)
+# - integrations/: External system integrations (auditd, console)
 { config, pkgs, lib, options, ... }:
 
 let
@@ -36,12 +39,16 @@ let
 in
 {
   # ==========================================================================
-  # Import Bouncer Modules
+  # Import Sub-Modules
   # ==========================================================================
   imports = [
+    # Bouncers - Response mechanisms
     ./bouncers/firewall.nix
     ./bouncers/haproxy.nix
     ./bouncers/python.nix
+    # Integrations - External system connections
+    ./integrations/auditd.nix
+    ./integrations/console.nix
   ];
 
   # ==========================================================================
@@ -143,7 +150,7 @@ in
     };
 
     # ==========================================================================
-    # Feature Toggles (Simple Boolean Options)
+    # Detection Features (Simple Boolean Options)
     # ==========================================================================
 
     features = {
@@ -228,50 +235,6 @@ in
     };
 
     # ==========================================================================
-    # Console Enrollment (Optional)
-    # ==========================================================================
-
-    console = {
-      enrollKeyFile = lib.mkOption {
-        type = lib.types.nullOr lib.types.str;
-        description = ''
-          Path to file containing the CrowdSec Console enrollment key.
-          
-          Enrolling connects your instance to the CrowdSec Console for:
-          - Centralized monitoring and management
-          - Access to community and commercial blocklists
-          - Threat intelligence dashboards
-          
-          Get your enrollment key from: https://app.crowdsec.net/
-          
-          [NIS2 COMPLIANCE]
-          Article 21(2)(g) - Security Monitoring: Provides centralized
-          visibility into security events across infrastructure.
-          
-          Article 23 - Reporting: Facilitates incident documentation
-          and reporting through centralized logging.
-        '';
-        default = null;
-        example = "/run/secrets/crowdsec-enroll-key";
-      };
-
-      shareDecisions = lib.mkOption {
-        type = lib.types.bool;
-        description = ''
-          Share your detected threats with the CrowdSec community.
-          
-          When enabled, anonymized attack signals are shared to improve
-          collective threat intelligence for all CrowdSec users.
-          
-          [NIS2 COMPLIANCE]
-          Article 14 - Information Sharing: Contributes to EU-wide
-          cybersecurity by participating in threat intelligence sharing.
-        '';
-        default = true;
-      };
-    };
-
-    # ==========================================================================
     # Hub Configuration (Parsers, Scenarios, Collections)
     # ==========================================================================
 
@@ -348,66 +311,6 @@ in
           }
         ]
       '';
-    };
-
-    # ==========================================================================
-    # Auditd Integration
-    # ==========================================================================
-
-    auditd = {
-      nixWrappersWhitelistProcess = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        description = ''
-          List of process names to whitelist from auditd monitoring.
-          
-          NOTE: This feature is currently disabled due to compatibility issues
-          with the 'comm' field filter in some versions of auditd. The option
-          is preserved for future use when auditd compatibility is resolved.
-          
-          NixOS uses wrapper scripts in /run/wrappers/bin for setuid/setgid
-          programs (like sudo, ping, etc.). These wrappers can generate a lot
-          of noise in auditd logs.
-          
-          [NIS2 COMPLIANCE]
-          Article 21(2)(g) - Security Monitoring: Reduces audit log noise
-          while maintaining security visibility on critical processes.
-        '';
-        default = [];
-        example = [ "sshd" "systemd" "sudo" ];
-      };
-
-      enable = lib.mkOption {
-        type = lib.types.bool;
-        description = ''
-          Enable auditd integration with CrowdSec.
-          
-          When enabled, configures auditd to send audit events to CrowdSec
-          for analysis. This enables detection of:
-          - Privilege escalation attempts
-          - Unauthorized file access
-          - System call anomalies
-          - User authentication events
-          
-          [NIS2 COMPLIANCE]
-          Article 21(2)(g) - Security Monitoring: Provides kernel-level
-          visibility into security events and potential threats.
-        '';
-        default = false;
-      };
-
-      rules = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        description = ''
-          Additional auditd rules to configure for CrowdSec monitoring.
-          
-          These rules are added to the system's auditd configuration.
-        '';
-        default = [];
-        example = [
-          "-w /etc/passwd -p wa -k identity"
-          "-w /etc/shadow -p wa -k identity"
-        ];
-      };
     };
 
     # ==========================================================================
@@ -681,11 +584,6 @@ in
         '') cfg.hub.parsers}
       '';
 
-      # ========================================================================
-      # Auditd Configuration
-      # ========================================================================
-      auditdEnabled = cfg.auditd.enable;
-
     in lib.mkMerge [
 
       # ==========================================================================
@@ -729,18 +627,6 @@ in
           cfg.package  # Includes cscli
         ];
       }
-
-      # ==========================================================================
-      # Auditd Integration
-      # ==========================================================================
-      (lib.mkIf auditdEnabled {
-        security.auditd.enable = true;
-        
-        # Add user-defined audit rules only
-        # Note: The nixWrappersWhitelistProcess feature is currently disabled
-        # due to auditd compatibility issues with the 'comm' field filter
-        security.audit.rules = cfg.auditd.rules;
-      })
 
       # ==========================================================================
       # Custom Implementation
@@ -829,6 +715,7 @@ in
             }
 
             # Console enrollment (if configured)
+            # Note: console options are defined in integrations/console.nix
             (lib.mkIf (cfg.console.enrollKeyFile != null) {
               console.tokenFile = cfg.console.enrollKeyFile;
             })
