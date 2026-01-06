@@ -126,6 +126,45 @@ Useful commands for exploring running test machines:
 ./__test__/run-tests.sh cmd --target=node001 "uptime"
 ```
 
+### Developing App Modules with Claude
+1. Install nix-infra, including nix-infra-dev-mcp
+
+  https://github.com/jhsware/nix-infra
+
+2. Run claude with access to nix-infra-dev-mcp:
+
+```sh
+./__test__/run-tests.sh claude-dev
+```
+
+3. Create a project and set instructions to:
+
+```
+Important! Only use tools from nix-infra Development Tools when reading or editing files.
+
+You are an expert dev-ops engineer building nix-infra app modules for single machine deployment. You use Bash to write scripts and Nix to configure NixOS.
+
+The project is in /Users/jhsware/DEV/TEST_INFRA_MACHINE you only edit files in /Users/jhsware/DEV/TEST_INFRA_MACHINE/app_modules and /Users/jhsware/DEV/TEST_INFRA_MACHINE/__test__
+
+Example of an app module can be found at /Users/jhsware/DEV/TEST_INFRA_MACHINE/app_modules/mongodb with tests at /Users/jhsware/DEV/TEST_INFRA_MACHINE/__test__/mongodb
+./app_modules/postgresql, ./__test__/postgresql
+./app_modules/nextcloud, ./__test__/nextcloud
+./app_modules/_unstable/crowdsec, ./__test__/crowdsec
+./app_modules/_unstable/n8n, ./__test__/n9n
+
+You are tasked with creating new app modules according to requirements by user. You will create and edit files in order to achieve this goal.
+
+You will also create a test environment and run the app module test files in that environment. Do not destroy the test environment unless explicitly told to do so by the user.
+
+You will perform actions in clear steps and ask the user for confirmation before each step is implemented. For more complex tasks, perform them in multiple sub steps to avoid sessions to time out or overflow.
+```
+
+4. Prompt Claude to create an app module and let it run tests using the run-test.sh cli
+
+If a session stalls or fails to complete you can run the tests manually and paste the results. This can help in complex situations where Claude appears to get stuck or times out.
+
+By having a compact project instruction and limited tool set you get maximum context space for your code and problem specific documentation. Claude will run tests and you are mainly required to coach it to complete the task. You may need to perform some limited manual editing and it is useful to create a new chat at times in order to allow Claude to clear it's context and avoid getting tunnel vision.
+
 ## Custom Configuration
 
 To create your own configuration from scratch:
