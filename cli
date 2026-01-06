@@ -9,13 +9,6 @@ LOCATION=${LOCATION:-"hel1"}
 MACHINE_TYPE=${MACHINE_TYPE:-"cpx21"}
 ENV=${ENV:-"$WORK_DIR/.env"}
 
-# Check for nix-infra CLI
-if ! command -v nix-infra >/dev/null 2>&1; then
-  echo "The 'nix-infra' cli is required for this script to work."
-  echo "Visit https://github.com/jhsware/nix-infra for instructions on installation"
-  exit 1
-fi
-
 read -r -d '' __help_text__ <<EOF || true
 nix-infra-machine CLI
 =====================
@@ -111,6 +104,13 @@ done
 # Read the environment file if provided
 if [ "$ENV" != "" ] && [ -f "$ENV" ]; then
   source "$ENV"
+fi
+
+# Check for nix-infra CLI
+if [ "$NIX_INFRA" = "nix-infra" ] && ! command -v nix-infra >/dev/null 2>&1; then
+  echo "The 'nix-infra' cli is required for this script to work."
+  echo "Visit https://github.com/jhsware/nix-infra for instructions on installation"
+  exit 1
 fi
 
 # A Hetzner Cloud token is required
@@ -306,7 +306,7 @@ if [ "$CMD" = "create" ]; then
       --machine-type="$MACHINE_TYPE" \
       --node-names="$TARGET"
 
-  cleanupOnFail $? "ERROR: Provisioning failed! Cleaning up..."
+  cleanupOnFail $? "WARNING: Provisioning failed! Cleaning up..."
 
   _provision=$(date +%s)
 

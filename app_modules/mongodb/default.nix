@@ -1,18 +1,20 @@
 { config, pkgs, lib, ... }:
 let
-  appName = "mongodb-4";
-  appPort = 27017;
+  appName = "mongodb";
+  defaultPort = 27017;
 
   cfg = config.infrastructure.${appName};
-
-  dataDir = "/var/lib/mongodb-4";
-  execStartPreScript = pkgs.writeShellScript "preStart" ''
-    ${pkgs.coreutils}/bin/mkdir -p ${dataDir}
-  '';
 in
 {
   options.infrastructure.${appName} = {
-    enable = lib.mkEnableOption "infrastructure.mongodb oci";
+    enable = lib.mkEnableOption "infrastructure.mongodb";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      description = "MongoDB package to use.";
+      default = pkgs.mongodb-ce;
+      example = "pkgs.mongodb";
+    };
 
     bindToIp = lib.mkOption {
       type = lib.types.str;
@@ -23,32 +25,24 @@ in
     bindToPort = lib.mkOption {
       type = lib.types.int;
       description = "Port to bind.";
-      default = appPort;
+      default = defaultPort;
     };
   };
 
   config = lib.mkIf cfg.enable {
-    # https://stackoverflow.com/questions/42912755/how-to-create-a-db-for-mongodb-container-on-start-up
-    infrastructure.oci-containers.backend = "podman";
-    infrastructure.oci-containers.containers.${appName} = {
-      app = {
-        name = appName;
-      };
-      image = "mongo:4.4.29-focal";
-      autoStart = true;
-      ports = [
-        "${cfg.bindToIp}:${toString cfg.bindToPort}:27017"
-      ];
-      bindToIp = cfg.bindToIp;
-      volumes = [
-        "${dataDir}:/data/db"
-      ];
-
-      execHooks = {
-        ExecStartPre = [
-          "${execStartPreScript}"
-        ];
-      };
+    services.mongodb = {
+      enable = true;
+      package = cfg.package;
+      bind_ip = cfg.bindToIp;
+      extraConfig = lib.mkIf (cfg.bindToPort != defaultPort) ''
+        net.port: ${toString cfg.bindToPort}
+      '';
     };
+
+    # Install mongosh for CLI access
+    environment.systemPackages = [ pkgs.mongosh ];
+
+    # Open firewall for MongoDB if binding to non-localhost
+    networking.firewall.allowedTCPPorts = lib.mkIf (cfg.bindToIp != "127.0.0.1") [ cfg.bindToPort ];
   };
 }

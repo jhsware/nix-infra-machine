@@ -2,6 +2,15 @@
 # Shared helper functions for nix-infra-machine tests
 
 # ============================================================================
+# Colors for Test Output
+# ============================================================================
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# ============================================================================
 # Utility Functions
 # ============================================================================
 
@@ -16,6 +25,31 @@ appendWithLineBreak() {
 cmd() {
   $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$1" "$2"
 }
+
+# Get command output with node prefix stripped and whitespace trimmed
+# Use for single values that need arithmetic or exact comparison
+# Example: count=$(cmd_value "$node" "pgrep -c redis-server || echo 0")
+cmd_value() {
+  local node="$1"
+  local command="$2"
+  local output
+  output=$(cmd "$node" "$command")
+  # Strip "nodename: " prefix and trim whitespace
+  echo "$output" | sed "s/^${node}: //" | tr -d '[:space:]'
+}
+
+# Get command output with node prefix stripped but preserving structure
+# Use for multi-line output or when whitespace matters
+# Example: config=$(cmd_clean "$node" "cat /etc/config")
+cmd_clean() {
+  local node="$1"
+  local command="$2"
+  local output
+  output=$(cmd "$node" "$command")
+  # Strip "nodename: " prefix from each line
+  echo "$output" | sed "s/^${node}: //"
+}
+
 
 printTime() {
   local _start=$1; local _end=$2; local _secs=$((_end-_start))
@@ -78,8 +112,8 @@ checkNixos() {
       echo "  ✓ nixos: ok ($node)"
     else
       echo "  ✗ nixos: fail ($node)"
-      if [ -n "$output" ]; then
-        echo "$output"
+      if [ -n "$output" ] && [[ "$output" == ERROR:* ]]; then
+        echo "    $output"
       fi
       _nixos_fail="true"
     fi
@@ -103,8 +137,8 @@ checkPodman() {
       echo "  ✓ podman: ok ($node)"
     else
       echo "  ✗ podman: not installed or not running ($node)"
-      if [ -n "$output" ]; then
-        echo "$output"
+      if [ -n "$output" ] && [[ "$output" == ERROR:* ]]; then
+        echo "    $output"
       fi
       _failed="yes"
     fi
@@ -125,8 +159,8 @@ checkService() {
     return 0
   else
     echo "  ✗ $SERVICE: inactive ($NODE)"
-    if [ -n "$output" ]; then
-      echo "$output"
+    if [ -n "$output" ] && [[ "$output" == ERROR:* ]]; then
+      echo "    $output"
     fi
     return 1
   fi
@@ -162,8 +196,8 @@ checkHttpEndpoint() {
     return 0
   else
     echo "  ✗ HTTP $URL: expected '$EXPECTED' ($NODE)"
-    if [ -n "$output" ]; then
-      echo "    Got: $output"
+    if [ -n "$output" ] && [[ "$output" == ERROR:* ]]; then
+      echo "    $output"
     fi
     return 1
   fi
@@ -181,8 +215,8 @@ checkTcpPort() {
     return 0
   else
     echo "  ✗ TCP $HOST:$PORT: closed ($NODE)"
-    if [ -n "$output" ]; then
-      echo "$output"
+    if [ -n "$output" ] && [[ "$output" == ERROR:* ]]; then
+      echo "    $output"
     fi
     return 1
   fi
@@ -238,8 +272,8 @@ waitForContainer() {
   done
   
   echo "  ✗ Container $CONTAINER did not start within ${TIMEOUT}s"
-  if [ -n "$last_output" ]; then
-    echo "    Last status: $last_output"
+  if [ -n "$last_output" ] && [[ "$last_output" == ERROR:* ]]; then
+    echo "    $last_output"
   fi
   return 1
 }
@@ -264,8 +298,8 @@ waitForService() {
   done
   
   echo "  ✗ Service $SERVICE did not become active within ${TIMEOUT}s"
-  if [ -n "$last_output" ]; then
-    echo "    Last status: $last_output"
+  if [ -n "$last_output" ] && [[ "$last_output" == ERROR:* ]]; then
+    echo "    $last_output"
   fi
   return 1
 }
@@ -288,4 +322,25 @@ getServiceLogs() {
   echo "--- Service logs for $SERVICE on $NODE ---"
   cmd "$NODE" "journalctl -n $LINES -u $SERVICE" 2>&1
   echo "--- End of logs ---"
+}
+
+# ============================================================================
+# Info output
+# ============================================================================
+
+# Print info line (not pass/fail)
+# Usage: print_info "label" "value"
+print_info() {
+  local label="$1"
+  local value="$2"
+  
+  echo -e "  ${GREEN}✓${NC} $label: $value [info]"
+}
+
+# Print cleanup success
+# Usage: print_cleanup "label"
+print_cleanup() {
+  local label="$1"
+  
+  echo -e "  ${GREEN}✓${NC} $label [pass]"
 }

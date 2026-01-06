@@ -2,21 +2,16 @@
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 WORK_DIR=${WORK_DIR:-$(dirname "$SCRIPT_DIR")}
 NIX_INFRA=${NIX_INFRA:-"nix-infra"}
-NIXOS_VERSION=${NIXOS_VERSION:-"25.05"}
+NIXOS_VERSION=${NIXOS_VERSION:-"25.11"}
+MACHINE_TYPE=${MACHINE_TYPE:-"cpx22"}
 SSH_KEY="nixinfra-machine"
 SSH_EMAIL=${SSH_EMAIL:-your-email@example.com}
 ENV=${ENV:-.env}
 SECRETS_PWD=${SECRETS_PWD:-my_secrets_password}
-TEST_NODES=${TEST_NODES:-"testnode001"}
-
-# Check for nix-infra CLI if using default
-if [ "$NIX_INFRA" = "nix-infra" ] && ! command -v nix-infra >/dev/null 2>&1; then
-  echo "The 'nix-infra' CLI is required for this script to work."
-  echo "Visit https://github.com/jhsware/nix-infra for installation instructions."
-  exit 1
-fi
+TARGET=${TARGET:-"testnode001"}
 
 read -r -d '' __help_text__ <<EOF || true
+
 nix-infra-machine Test Runner
 =============================
 
@@ -40,6 +35,8 @@ Options:
   --env=<file>        Environment file (default: .env)
   --no-teardown       Don't tear down after test
   --target=<nodes>    Target node(s) for commands
+  --nixos-version=<version> Override version
+  --machine-type=<type> Override machine type
 
 Examples:
   # Run the full test cycle
@@ -89,6 +86,14 @@ for i in "$@"; do
     PORT_MAPPING="${i#*=}"
     shift
     ;;
+    --nixos-version=*)
+    NIXOS_VERSION="${i#*=}"
+    shift
+    ;;
+    --machine-type=*)
+    MACHINE_TYPE="${i#*=}"
+    shift
+    ;;
     *)
     REST="$@"
     ;;
@@ -99,6 +104,13 @@ if [ "$ENV" != "" ] && [ -f "$ENV" ]; then
   source $ENV
 fi
 
+# Check for nix-infra CLI if using default
+if [ "$NIX_INFRA" = "nix-infra" ] && ! command -v nix-infra >/dev/null 2>&1; then
+  echo "The 'nix-infra' CLI is required for this script to work."
+  echo "Visit https://github.com/jhsware/nix-infra for installation instructions."
+  exit 1
+fi
+
 if [ -z "$HCLOUD_TOKEN" ]; then
   echo "Missing env-var HCLOUD_TOKEN. Load through .env-file that is specified through --env."
   exit 1
@@ -106,6 +118,8 @@ fi
 
 # Source shared helpers
 source "$SCRIPT_DIR/shared.sh"
+source "$SCRIPT_DIR/assertions.sh"
+source "$SCRIPT_DIR/timeouts.sh"
 
 # ============================================================================
 # Test Runner Commands
@@ -142,8 +156,9 @@ if [ "$CMD" = "run" ]; then
 
   if [ "$NO_TEARDOWN" != "true" ]; then
     echo "Resetting node configurations..."
-    $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TEST_NODES" 'rm -f /etc/nixos/$(hostname).nix'
-    $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TEST_NODES" "nixos-rebuild switch --fast"
+    $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" 'rm -f /etc/nixos/$(hostname).nix'
+    $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" "nixos-rebuild switch --fast"
+
   fi
   
   exit 0
@@ -161,8 +176,9 @@ if [ "$CMD" = "reset" ]; then
   fi
 
   echo "Cleaning up node configuration..."
-  $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TEST_NODES" 'rm -f /etc/nixos/$(hostname).nix'
-  $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TEST_NODES" "nixos-rebuild switch --fast"
+  $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" 'rm -f /etc/nixos/$(hostname).nix'
+  $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" "nixos-rebuild switch --fast"
+
 
   sleep 1
 
@@ -188,13 +204,14 @@ fi
 
 destroyFleet() {
   $NIX_INFRA fleet destroy -d "$WORK_DIR" --batch \
-      --target="$TEST_NODES"
+      --target="$TARGET"
 
   $NIX_INFRA ssh-key remove -d "$WORK_DIR" --batch --name="$SSH_KEY"
 
-  echo "Removing /ssh /secrets..."
-  rm -rf "$WORK_DIR/ssh" "$WORK_DIR/secrets"
+  echo "Remove /secrets..."
+  rm -rf "$WORK_DIR/secrets"
 }
+
 
 cleanupOnFail() {
   if [ $1 -ne 0 ]; then
@@ -210,22 +227,23 @@ if [ "$CMD" = "destroy" ]; then
 fi
 
 if [ "$CMD" = "status" ]; then
-  testFleet "$TEST_NODES"
+  testFleet "$TARGET"
   exit 0
 fi
+
 
 if [ "$CMD" = "update" ]; then
   if [ -z "$REST" ]; then
     echo "Usage: $0 update --env=$ENV [node1 node2 ...]"
     exit 1
   fi
-  $NIX_INFRA fleet update -d "$WORK_DIR" --batch --env="$WORK_DIR/.env" \
+  $NIX_INFRA fleet update -d "$WORK_DIR" --batch --env="$ENV" \
     --nixos-version="$NIXOS_VERSION" \
     --node-module="node_types/standalone_machine.nix" \
     --target="$REST" \
     --rebuild
   
-  $NIX_INFRA fleet deploy-apps -d "$WORK_DIR" --batch --env="$WORK_DIR/.env" \
+  $NIX_INFRA fleet deploy-apps -d "$WORK_DIR" --batch --env="$ENV" \
     --target="$REST"
   $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$REST" "nixos-rebuild switch --fast"
   exit 0
@@ -236,9 +254,11 @@ if [ "$CMD" = "upgrade" ]; then
     echo "Usage: $0 upgrade --env=$ENV [node1 node2 ...]"
     exit 1
   fi
-  $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$REST" "nixos-rebuild switch --upgrade"
+  $NIX_INFRA fleet upgrade-nixos -d "$WORK_DIR" --batch --env="$ENV" --nixos-version="$NIXOS_VERSION" \
+    --target="$REST"
   exit 0
 fi
+
 
 # ============================================================================
 # Interactive Commands
@@ -284,7 +304,7 @@ if [ "$CMD" = "port-forward" ]; then
   IFS=: read LOCAL_PORT REMOTE_PORT <<< "$PORT_MAPPING"
   IFS=$OLD_IFS
 
-  $NIX_INFRA fleet port-forward -d "$WORK_DIR" --env="$WORK_DIR/.env" \
+  $NIX_INFRA fleet port-forward -d "$WORK_DIR" --env="$ENV" \
     --target="$TARGET" \
     --local-port="$LOCAL_PORT" \
     --remote-port="$REMOTE_PORT"
@@ -296,6 +316,11 @@ fi
 # ============================================================================
 
 if [ "$CMD" = "create" ]; then
+  if [ -d "$WORK_DIR/secrets" ]; then
+    echo "Found existing ./secrets, this appears to be a live project. Creating a test environment may destroy it."
+    exit 1
+  fi
+
   if [ ! -f "$ENV" ]; then
     read -r -d '' env <<EOF || true
 # NOTE: The following secrets are required for various operations
@@ -319,31 +344,31 @@ EOF
   ssh-add "$WORK_DIR/ssh/$SSH_KEY"
   
   echo "*** Provisioning NixOS $NIXOS_VERSION ***"
-
-  $NIX_INFRA fleet provision -d "$WORK_DIR" --batch --env="$WORK_DIR/.env" \
+  $NIX_INFRA fleet provision -d "$WORK_DIR" --batch --env="$ENV" \
       --nixos-version="$NIXOS_VERSION" \
       --ssh-key=$SSH_KEY \
       --location=hel1 \
-      --machine-type=cpx21 \
-      --node-names="$TEST_NODES"
+      --machine-type="$MACHINE_TYPE" \
+      --node-names="$TARGET"
 
-  cleanupOnFail $? "ERROR: Provisioning failed! Cleaning up..."
+  cleanupOnFail $? "WARNING: Provisioning failed! Cleaning up..."
 
   _provision=$(date +%s)
 
-  $NIX_INFRA fleet init-machine -d "$WORK_DIR" --batch --env="$WORK_DIR/.env" \
+  $NIX_INFRA fleet init-machine -d "$WORK_DIR" --batch --env="$ENV" \
       --nixos-version="$NIXOS_VERSION" \
-      --target="$TEST_NODES" \
+      --target="$TARGET" \
       --node-module="node_types/standalone_machine.nix"
 
-  $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TEST_NODES" "nixos-rebuild switch --fast"
+  $NIX_INFRA fleet cmd -d "$WORK_DIR" --target="$TARGET" "nixos-rebuild switch --fast"
 
   _init_nodes=$(date +%s)
 
   # Verify the operation of the test fleet
   echo "******************************************"
-  testFleet "$TEST_NODES"
+  testFleet "$TARGET"
   echo "******************************************"
+
 
   _end=$(date +%s)
 

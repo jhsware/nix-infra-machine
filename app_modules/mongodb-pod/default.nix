@@ -1,18 +1,18 @@
 { config, pkgs, lib, ... }:
 let
-  appName = "mongodb";
+  appName = "mongodb-pod";
   appPort = 27017;
 
   cfg = config.infrastructure.${appName};
 
-  dataDir = "/var/lib/mongodb";
+  dataDir = "/var/lib/mongodb-pod";
   execStartPreScript = pkgs.writeShellScript "preStart" ''
     ${pkgs.coreutils}/bin/mkdir -p ${dataDir}
   '';
 in
 {
   options.infrastructure.${appName} = {
-    enable = lib.mkEnableOption "infrastructure.mongodb oci";
+    enable = lib.mkEnableOption "infrastructure.mongodb-pod oci";
 
     image = lib.mkOption {
       type = lib.types.str;
