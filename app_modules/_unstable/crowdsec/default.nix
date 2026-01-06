@@ -1,3 +1,9 @@
+# CrowdSec - Collaborative Intrusion Prevention System
+# 
+# This module provides simplified boolean feature toggles for common use cases
+# and can use either a custom implementation or the native NixOS module.
+#
+# Bouncer modules are imported separately from ./bouncers/
 { config, pkgs, lib, options, ... }:
 
 let
@@ -29,6 +35,18 @@ let
 
 in
 {
+  # ==========================================================================
+  # Import Bouncer Modules
+  # ==========================================================================
+  imports = [
+    ./bouncers/firewall.nix
+    ./bouncers/haproxy.nix
+    ./bouncers/python.nix
+  ];
+
+  # ==========================================================================
+  # Options
+  # ==========================================================================
   options.infrastructure.${appName} = {
     enable = lib.mkEnableOption ''
       CrowdSec - Collaborative Intrusion Prevention System.
@@ -190,51 +208,6 @@ in
         default = false;
       };
 
-      firewallBouncer = lib.mkOption {
-        type = lib.types.bool;
-        description = ''
-          Enable the firewall bouncer to automatically block malicious IPs.
-          
-          The bouncer fetches decisions from the CrowdSec API and applies
-          them to the system firewall (iptables/nftables). Available in
-          nixpkgs as pkgs.crowdsec-firewall-bouncer starting from NixOS 25.11.
-          
-          When using nftables mode (default), the module creates declarative
-          nftables tables that integrate properly with NixOS's firewall and
-          survive system rebuilds.
-          
-          [NIS2 COMPLIANCE]
-          Article 21(2)(b) - Incident Handling: Provides automated incident
-          response by blocking identified threats in real-time.
-          
-          Article 21(2)(d) - Network Security: Implements active network
-          protection through automated firewall rule management.
-        '';
-        default = false;
-      };
-
-      haproxyProtection = lib.mkOption {
-        type = lib.types.bool;
-        description = ''
-          Enable HAProxy security integration via SPOA (Stream Processing Offload API).
-          
-          The cs-haproxy-spoa-bouncer acts as a stream processing agent that checks
-          each connection in real-time against CrowdSec's decision database before
-          allowing traffic to reach your application servers.
-          
-          This provides layer 7 application-level protection, complementing the
-          layer 3/4 protection from the firewall bouncer.
-          
-          [NIS2 COMPLIANCE]
-          Article 21(2)(d) - Network Security: Provides application-layer protection
-          for HTTP/HTTPS traffic through HAProxy integration.
-          
-          Article 21(2)(e) - Supply Chain Security: Protects web applications that
-          may be part of the digital supply chain.
-        '';
-        default = false;
-      };
-
       communityBlocklists = lib.mkOption {
         type = lib.types.bool;
         description = ''
@@ -376,302 +349,6 @@ in
         ]
       '';
     };
-
-    # ==========================================================================
-    # Firewall Bouncer Configuration
-    # ==========================================================================
-
-    bouncer = {
-      package = lib.mkOption {
-        type = lib.types.nullOr lib.types.package;
-        description = ''
-          CrowdSec firewall bouncer package to use.
-          
-          The package is available in nixpkgs as pkgs.crowdsec-firewall-bouncer
-          starting from NixOS 25.11.
-          
-          Set to null to disable the bouncer even when features.firewallBouncer
-          is enabled (useful for testing detection without blocking).
-        '';
-        default = pkgs.crowdsec-firewall-bouncer or null;
-        defaultText = lib.literalExpression "pkgs.crowdsec-firewall-bouncer";
-        example = lib.literalExpression "pkgs.crowdsec-firewall-bouncer";
-      };
-
-      mode = lib.mkOption {
-        type = lib.types.enum [ "iptables" "nftables" "ipset" ];
-        description = ''
-          Firewall mode for the bouncer.
-          
-          - "nftables": Recommended for NixOS. Uses nftables sets which integrate
-            well with NixOS declarative firewall. The module creates the necessary
-            tables/chains declaratively, and the bouncer only manages set membership.
-          
-          - "iptables": Traditional iptables rules. May conflict with NixOS firewall
-            on system rebuilds.
-          
-          - "ipset": Uses ipset for IP blocking. More compatible with iptables-based
-            firewalls and survives rule flushes better.
-          
-          [NIS2 COMPLIANCE]
-          All modes provide equivalent security protection. Choose based on your
-          existing firewall infrastructure.
-        '';
-        default = "nftables";
-      };
-
-      nftablesIntegration = lib.mkOption {
-        type = lib.types.bool;
-        description = ''
-          When using nftables mode, declaratively create the CrowdSec table
-          structure in NixOS configuration. This ensures the tables/chains
-          survive NixOS rebuilds and prevents conflicts with the declarative
-          firewall.
-          
-          When enabled:
-          - Creates "crowdsec" and "crowdsec6" tables declaratively
-          - Configures bouncer in "set-only" mode
-          - Bouncer only manages IP set membership, not table structure
-          
-          When disabled:
-          - Bouncer creates and manages its own tables
-          - May conflict with NixOS firewall rebuilds
-        '';
-        default = true;
-      };
-
-      denyAction = lib.mkOption {
-        type = lib.types.enum [ "DROP" "REJECT" ];
-        description = ''
-          Action to take for blocked IPs.
-          
-          - "DROP": Silently drop packets (recommended for security)
-          - "REJECT": Send rejection response to client
-          
-          DROP is generally preferred as it doesn't reveal firewall presence.
-        '';
-        default = "DROP";
-      };
-
-      denyLog = lib.mkOption {
-        type = lib.types.bool;
-        description = ''
-          Log blocked connections before dropping/rejecting.
-          
-          [NIS2 COMPLIANCE]
-          Article 21(2)(g) - Security Monitoring: Maintains audit trail
-          of blocked threats for incident analysis and reporting.
-        '';
-        default = true;
-      };
-
-      denyLogPrefix = lib.mkOption {
-        type = lib.types.str;
-        description = "Prefix for firewall log entries.";
-        default = "crowdsec: ";
-      };
-
-      banDuration = lib.mkOption {
-        type = lib.types.str;
-        description = ''
-          Default ban duration for blocked IPs.
-          
-          Format: Go duration string (e.g., "4h", "24h", "7d")
-        '';
-        default = "4h";
-        example = "24h";
-      };
-    };
-
-    # ==========================================================================
-    # HAProxy SPOA Bouncer Configuration
-    # ==========================================================================
-
-    haproxy = {
-      package = lib.mkOption {
-        type = lib.types.nullOr lib.types.package;
-        description = ''
-          CrowdSec HAProxy SPOA bouncer package to use.
-          
-          The package should be available as pkgs.cs-haproxy-spoa-bouncer.
-          Set to null to disable the bouncer even when features.haproxyProtection
-          is enabled.
-        '';
-        default = pkgs.cs-haproxy-spoa-bouncer or null;
-        defaultText = lib.literalExpression "pkgs.cs-haproxy-spoa-bouncer";
-        example = lib.literalExpression "pkgs.cs-haproxy-spoa-bouncer";
-      };
-
-      listenAddr = lib.mkOption {
-        type = lib.types.str;
-        description = ''
-          Address for the SPOA bouncer to listen on.
-          HAProxy will connect to this address to check decisions.
-        '';
-        default = "127.0.0.1";
-        example = "0.0.0.0";
-      };
-
-      listenPort = lib.mkOption {
-        type = lib.types.port;
-        description = "Port for the SPOA bouncer to listen on.";
-        default = 3000;
-        example = 3000;
-      };
-
-      action = lib.mkOption {
-        type = lib.types.enum [ "deny" "tarpit" ];
-        description = ''
-          Action to take for blocked requests in HAProxy.
-          
-          - "deny": Immediately reject the connection
-          - "tarpit": Slow down the connection (tar pit)
-        '';
-        default = "deny";
-      };
-
-      logLevel = lib.mkOption {
-        type = lib.types.enum [ "error" "warning" "info" "debug" ];
-        description = "Log level for the SPOA bouncer.";
-        default = "info";
-      };
-    };
-
-
-    # ==========================================================================
-    # Python Bouncer Configuration
-    # ==========================================================================
-
-    python = {
-      enable = lib.mkOption {
-        type = lib.types.bool;
-        description = ''
-          Enable Python bouncer registration for use with pycrowdsec.
-          
-          This registers a bouncer with CrowdSec and stores the API key in a
-          configurable location so Python applications can use the pycrowdsec
-          library to check IPs against CrowdSec decisions.
-          
-          Python applications should use the StreamClient or QueryClient from
-          pycrowdsec to query decisions:
-          
-          ```python
-          from pycrowdsec.client import StreamClient
-          client = StreamClient(
-              api_key=open("/run/crowdsec-python-bouncer/api_key").read().strip(),
-              lapi_url="http://127.0.0.1:8080/"
-          )
-          client.run()
-          action = client.get_action_for("1.2.3.4")  # Returns "ban", "captcha", etc.
-          ```
-          
-          For Flask/Django integration, configure the middleware to read the API key
-          from the configured apiKeyFile path.
-          
-          [NIS2 COMPLIANCE]
-          Article 21(2)(d) - Network Security: Provides application-layer protection
-          for Python web applications through CrowdSec integration.
-        '';
-        default = false;
-      };
-
-      bouncerName = lib.mkOption {
-        type = lib.types.str;
-        description = "Name to register the Python bouncer with in CrowdSec.";
-        default = "python-bouncer";
-        example = "my-flask-app-bouncer";
-      };
-
-      apiKeyFile = lib.mkOption {
-        type = lib.types.str;
-        description = ''
-          Path where the bouncer API key will be stored.
-          
-          This file will be readable by the configured group (default: root).
-          Python applications need read access to this file to authenticate
-          with the CrowdSec Local API.
-        '';
-        default = "/run/crowdsec-python-bouncer/api_key";
-        example = "/run/secrets/crowdsec-python-api-key";
-      };
-
-      apiKeyFileGroup = lib.mkOption {
-        type = lib.types.str;
-        description = ''
-          Group that should have read access to the API key file.
-          
-          Set this to match the group your Python application runs as.
-          For example, if your Flask app runs as user "flask" in group "flask",
-          set this to "flask".
-        '';
-        default = "root";
-        example = "www-data";
-      };
-
-      enableCapi = lib.mkOption {
-        type = lib.types.bool;
-        description = ''
-          Enable Central API (CAPI) credentials for signal sharing with python-capi-sdk.
-          
-          When enabled, this generates machine credentials that can be used with
-          the python-capi-sdk to send attack signals to CrowdSec's central infrastructure
-          and receive community blocklists.
-          
-          The credentials are stored in the capiCredentialsFile location.
-          
-          Example usage with python-capi-sdk:
-          
-          ```python
-          from cscapi.client import CAPIClient, CAPIClientConfig
-          from cscapi.sql_storage import SQLStorage
-          import yaml
-          
-          # Load credentials generated by this module
-          with open("/run/crowdsec-python-bouncer/capi_credentials.yaml") as f:
-              creds = yaml.safe_load(f)
-          
-          client = CAPIClient(
-              storage=SQLStorage(connection_string="sqlite:///signals.db"),
-              config=CAPIClientConfig(scenarios=["crowdsecurity/ssh-bf"])
-          )
-          ```
-          
-          [NIS2 COMPLIANCE]
-          Article 14 - Information Sharing: Enables participation in threat
-          intelligence sharing through the CrowdSec community network.
-        '';
-        default = false;
-      };
-
-      capiCredentialsFile = lib.mkOption {
-        type = lib.types.str;
-        description = ''
-          Path where CAPI credentials will be stored for python-capi-sdk.
-          
-          This file contains machine_id and password for authenticating
-          with CrowdSec's Central API.
-        '';
-        default = "/run/crowdsec-python-bouncer/capi_credentials.yaml";
-        example = "/run/secrets/crowdsec-capi-credentials.yaml";
-      };
-
-      capiScenarios = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        description = ''
-          Scenarios that your Python application will report signals for.
-          
-          These should match the attack patterns your application detects.
-          Common scenarios include:
-          - crowdsecurity/ssh-bf (SSH brute force)
-          - crowdsecurity/http-bf (HTTP brute force)
-          - crowdsecurity/http-crawl-non_statics (Web crawling)
-        '';
-        default = [];
-        example = [ "crowdsecurity/http-bf" "crowdsecurity/http-crawl-non_statics" ];
-      };
-    };
-
-
 
     # ==========================================================================
     # Auditd Integration
@@ -868,13 +545,15 @@ in
       };
 
       # Generate profiles file (CrowdSec expects multi-document YAML format)
+      # Use bouncer.banDuration if available, otherwise default to 4h
+      banDuration = cfg.bouncer.banDuration or "4h";
       profilesFile = pkgs.writeText "profiles.yaml" ''
         name: default_ip_remediation
         filters:
           - Alert.Remediation == true && Alert.GetScope() == "Ip"
         decisions:
           - type: ban
-            duration: ${cfg.bouncer.banDuration}
+            duration: ${banDuration}
         on_success: break
       '';
 
@@ -1003,292 +682,9 @@ in
       '';
 
       # ========================================================================
-      # Firewall Bouncer Configuration
-      # ========================================================================
-      bouncerEnabled = cfg.features.firewallBouncer && cfg.bouncer.package != null;
-      
-      # Whether to use declarative nftables integration
-      useNftablesIntegration = bouncerEnabled && cfg.bouncer.mode == "nftables" && cfg.bouncer.nftablesIntegration;
-
-      # Bouncer config - uses set-only mode when nftablesIntegration is enabled
-      bouncerConfigFile = yamlFormat.generate "crowdsec-firewall-bouncer.yaml" ({
-        mode = cfg.bouncer.mode;
-        update_frequency = "10s";
-        api_url = "http://${cfg.api.listenAddr}:${toString cfg.api.listenPort}/";
-        api_key = "\${BOUNCER_API_KEY}";
-        disable_ipv6 = false;
-        deny_action = cfg.bouncer.denyAction;
-        deny_log = cfg.bouncer.denyLog;
-        deny_log_prefix = cfg.bouncer.denyLogPrefix;
-      } // lib.optionalAttrs (cfg.bouncer.mode == "nftables") {
-        nftables = {
-          ipv4 = {
-            enabled = true;
-            set-only = useNftablesIntegration;
-            table = "crowdsec";
-            chain = "crowdsec-chain";
-            set = "crowdsec-blocklist";
-          };
-          ipv6 = {
-            enabled = true;
-            set-only = useNftablesIntegration;
-            table = "crowdsec6";
-            chain = "crowdsec6-chain";
-            set = "crowdsec6-blocklist";
-          };
-        };
-      } // lib.optionalAttrs (cfg.bouncer.mode == "iptables") {
-        iptables_chains = [ "INPUT" "FORWARD" ];
-      } // lib.optionalAttrs (cfg.bouncer.mode == "ipset") {
-        ipset_type = "nethash";
-        ipset = "crowdsec-blocklist";
-        ipset6 = "crowdsec6-blocklist";
-      });
-
-      bouncerRegisterScript = pkgs.writeShellScript "crowdsec-bouncer-register" ''
-        set -e
-        export PATH="${lib.makeBinPath [ cfg.package pkgs.coreutils pkgs.gnugrep pkgs.gnused ]}:$PATH"
-        
-        CONFIG_DIR="${stateDir}/config"
-        KEY_FILE="/var/lib/crowdsec-firewall-bouncer/api_key"
-        
-        # Wait for CrowdSec API to be ready
-        for i in $(seq 1 60); do
-          if cscli -c "$CONFIG_DIR/config.yaml" bouncers list >/dev/null 2>&1; then
-            break
-          fi
-          sleep 1
-        done
-        
-        # Check if bouncer already registered
-        if ! cscli -c "$CONFIG_DIR/config.yaml" bouncers list 2>/dev/null | grep -q "firewall-bouncer"; then
-          # Register new bouncer and save key
-          KEY=$(cscli -c "$CONFIG_DIR/config.yaml" bouncers add firewall-bouncer -o raw 2>/dev/null || echo "")
-          if [ -n "$KEY" ]; then
-            echo "$KEY" > "$KEY_FILE"
-            chmod 600 "$KEY_FILE"
-          fi
-        fi
-        
-        # Read existing key
-        if [ -f "$KEY_FILE" ]; then
-          export BOUNCER_API_KEY=$(cat "$KEY_FILE")
-        fi
-        
-        # Generate config with key substituted
-        # Use | as sed delimiter since API keys may contain /
-        if [ -n "$BOUNCER_API_KEY" ]; then
-          sed "s|\''${BOUNCER_API_KEY}|$BOUNCER_API_KEY|g" ${bouncerConfigFile} > /var/lib/crowdsec-firewall-bouncer/config.yaml
-        fi
-      '';
-
-      # ========================================================================
-      # HAProxy SPOA Bouncer Configuration
-      # ========================================================================
-      haproxyBouncerEnabled = cfg.features.haproxyProtection && cfg.haproxy.package != null;
-      
-      # HAProxy SPOA bouncer config file
-      haproxyBouncerConfigFile = yamlFormat.generate "crowdsec-haproxy-spoa-bouncer.yaml" {
-        lapi_url = "http://${cfg.api.listenAddr}:${toString cfg.api.listenPort}";
-        lapi_key = "\${HAPROXY_SPOA_API_KEY}";
-        action = cfg.haproxy.action;
-        log_level = cfg.haproxy.logLevel;
-        listen_addr = cfg.haproxy.listenAddr;
-        listen_port = cfg.haproxy.listenPort;
-        update_frequency = "10s";
-      };
-
-      haproxyBouncerRegisterScript = pkgs.writeShellScript "crowdsec-haproxy-bouncer-register" ''
-        set -e
-        export PATH="${lib.makeBinPath [ cfg.package pkgs.coreutils pkgs.gnugrep pkgs.gnused ]}:$PATH"
-        
-        CONFIG_DIR="${stateDir}/config"
-        KEY_FILE="/var/lib/crowdsec-haproxy-bouncer/api_key"
-        
-        # Wait for CrowdSec API to be ready
-        for i in $(seq 1 60); do
-          if cscli -c "$CONFIG_DIR/config.yaml" bouncers list >/dev/null 2>&1; then
-            break
-          fi
-          sleep 1
-        done
-        
-        # Check if bouncer already registered
-        if ! cscli -c "$CONFIG_DIR/config.yaml" bouncers list 2>/dev/null | grep -q "haproxy-spoa-bouncer"; then
-          # Register new bouncer and save key
-          KEY=$(cscli -c "$CONFIG_DIR/config.yaml" bouncers add haproxy-spoa-bouncer -o raw 2>/dev/null || echo "")
-          if [ -n "$KEY" ]; then
-            echo "$KEY" > "$KEY_FILE"
-            chmod 600 "$KEY_FILE"
-          fi
-        fi
-        
-        # Read existing key
-        if [ -f "$KEY_FILE" ]; then
-          export HAPROXY_SPOA_API_KEY=$(cat "$KEY_FILE")
-        fi
-        
-        # Generate config with key substituted
-        # Use | as sed delimiter since API keys may contain /
-        if [ -n "$HAPROXY_SPOA_API_KEY" ]; then
-          sed "s|\''${HAPROXY_SPOA_API_KEY}|$HAPROXY_SPOA_API_KEY|g" ${haproxyBouncerConfigFile} > /var/lib/crowdsec-haproxy-bouncer/config.yaml
-        fi
-      '';
-
-      # ========================================================================
-      # Python Bouncer Configuration (for pycrowdsec / python-capi-sdk)
-      # ========================================================================
-      pythonBouncerEnabled = cfg.python.enable;
-      
-      # Get the directory from the apiKeyFile path
-      pythonBouncerDir = builtins.dirOf cfg.python.apiKeyFile;
-      pythonCapiDir = builtins.dirOf cfg.python.capiCredentialsFile;
-
-      # Python bouncer registration script
-      # This registers a bouncer with CrowdSec and stores the API key
-      # for Python applications to use with pycrowdsec
-      pythonBouncerRegisterScript = pkgs.writeShellScript "crowdsec-python-bouncer-register" ''
-        set -e
-        export PATH="${lib.makeBinPath [ cfg.package pkgs.coreutils pkgs.gnugrep pkgs.gnused ]}:$PATH"
-        
-        CONFIG_DIR="${stateDir}/config"
-        KEY_FILE="${cfg.python.apiKeyFile}"
-        KEY_DIR="${pythonBouncerDir}"
-        BOUNCER_NAME="${cfg.python.bouncerName}"
-        KEY_GROUP="${cfg.python.apiKeyFileGroup}"
-        
-        # Create directory if it doesn't exist
-        mkdir -p "$KEY_DIR"
-        
-        # Wait for CrowdSec API to be ready
-        for i in $(seq 1 60); do
-          if cscli -c "$CONFIG_DIR/config.yaml" bouncers list >/dev/null 2>&1; then
-            break
-          fi
-          sleep 1
-        done
-        
-        # Check if bouncer already registered
-        if ! cscli -c "$CONFIG_DIR/config.yaml" bouncers list 2>/dev/null | grep -q "$BOUNCER_NAME"; then
-          # Register new bouncer and save key
-          KEY=$(cscli -c "$CONFIG_DIR/config.yaml" bouncers add "$BOUNCER_NAME" -o raw 2>/dev/null || echo "")
-          if [ -n "$KEY" ]; then
-            echo "$KEY" > "$KEY_FILE"
-            # Set permissions: owner read/write, group read
-            chmod 640 "$KEY_FILE"
-            chown root:"$KEY_GROUP" "$KEY_FILE"
-            echo "Python bouncer '$BOUNCER_NAME' registered successfully"
-            echo "API key stored at: $KEY_FILE"
-          fi
-        else
-          echo "Python bouncer '$BOUNCER_NAME' already registered"
-        fi
-        
-        # Create a helper config file for Python applications
-        LAPI_URL="http://${cfg.api.listenAddr}:${toString cfg.api.listenPort}/"
-        cat > "$KEY_DIR/config.yaml" << EOF
-        # CrowdSec Python Bouncer Configuration
-        # Generated by NixOS infrastructure.crowdsec module
-        #
-        # Usage with pycrowdsec:
-        #   from pycrowdsec.client import StreamClient
-        #   import yaml
-        #   
-        #   with open('${pythonBouncerDir}/config.yaml') as f:
-        #       config = yaml.safe_load(f)
-        #   
-        #   client = StreamClient(
-        #       api_key=open(config['api_key_file']).read().strip(),
-        #       lapi_url=config['lapi_url']
-        #   )
-        #   client.run()
-        
-        lapi_url: "$LAPI_URL"
-        api_key_file: "$KEY_FILE"
-        bouncer_name: "$BOUNCER_NAME"
-        EOF
-        chmod 644 "$KEY_DIR/config.yaml"
-        chown root:"$KEY_GROUP" "$KEY_DIR/config.yaml"
-      '';
-
-      # Python CAPI credentials script (for python-capi-sdk signal sharing)
-      pythonCapiRegisterScript = pkgs.writeShellScript "crowdsec-python-capi-register" ''
-        set -e
-        export PATH="${lib.makeBinPath [ cfg.package pkgs.coreutils pkgs.gnugrep pkgs.gnused pkgs.openssl ]}:$PATH"
-        
-        CONFIG_DIR="${stateDir}/config"
-        CAPI_FILE="${cfg.python.capiCredentialsFile}"
-        CAPI_DIR="${pythonCapiDir}"
-        KEY_GROUP="${cfg.python.apiKeyFileGroup}"
-        
-        # Create directory if it doesn't exist
-        mkdir -p "$CAPI_DIR"
-        
-        # Generate unique machine ID based on hostname and a random component
-        MACHINE_ID="python-$(hostname)-$(openssl rand -hex 4)"
-        
-        # Generate a secure password
-        MACHINE_PASSWORD=$(openssl rand -base64 32)
-        
-        # Check if credentials already exist
-        if [ -f "$CAPI_FILE" ]; then
-          echo "CAPI credentials already exist at $CAPI_FILE"
-        else
-          # Create credentials file for python-capi-sdk
-          cat > "$CAPI_FILE" << EOF
-        # CrowdSec Central API Credentials for python-capi-sdk
-        # Generated by NixOS infrastructure.crowdsec module
-        #
-        # Usage with python-capi-sdk:
-        #   from cscapi.client import CAPIClient, CAPIClientConfig
-        #   from cscapi.sql_storage import SQLStorage
-        #   from cscapi.utils import generate_machine_id_from_key
-        #   import yaml
-        #   
-        #   with open('${cfg.python.capiCredentialsFile}') as f:
-        #       creds = yaml.safe_load(f)
-        #   
-        #   client = CAPIClient(
-        #       storage=SQLStorage(connection_string="sqlite:///signals.db"),
-        #       config=CAPIClientConfig(
-        #           scenarios=${builtins.toJSON cfg.python.capiScenarios}
-        #       )
-        #   )
-        #   
-        #   # Note: Machine enrollment with CrowdSec CAPI requires manual approval
-        #   # Contact CrowdSec for signal sharing partnership details
-        
-        machine_id: "$MACHINE_ID"
-        password: "$MACHINE_PASSWORD"
-        scenarios: ${builtins.toJSON cfg.python.capiScenarios}
-        capi_url: "https://api.crowdsec.net/"
-
-        # Local API connection (for reading decisions)
-        lapi_url: "http://${cfg.api.listenAddr}:${toString cfg.api.listenPort}/"
-        EOF
-          chmod 640 "$CAPI_FILE"
-          chown root:"$KEY_GROUP" "$CAPI_FILE"
-          echo "CAPI credentials generated at $CAPI_FILE"
-          echo ""
-          echo "NOTE: To share signals with CrowdSec CAPI, you need to:"
-          echo "1. Contact CrowdSec for signal sharing partnership enrollment"
-          echo "2. Use the machine_id from this file when enrolling"
-          echo "3. Update your application to use the python-capi-sdk"
-        fi
-      '';
-
-
-      # ========================================================================
       # Auditd Configuration
       # ========================================================================
       auditdEnabled = cfg.auditd.enable;
-      
-      # Generate auditd whitelist rules for NixOS wrappers
-      # Note: auditd's exe filter doesn't support wildcards, so we use comm only
-      # This whitelists by process name which is sufficient for reducing noise
-      auditdWhitelistRules = lib.concatMapStringsSep "\n" (proc:
-        "-a never,exit -F arch=b64 -S execve -F comm=${proc}"
-      ) cfg.auditd.nixWrappersWhitelistProcess;
 
     in lib.mkMerge [
 
@@ -1298,31 +694,6 @@ in
       {
         # Assertions
         assertions = [
-          {
-            assertion = !cfg.features.firewallBouncer || cfg.bouncer.package != null;
-            message = ''
-              CrowdSec firewall bouncer is enabled but no package is configured.
-              
-              The bouncer package should be available as pkgs.crowdsec-firewall-bouncer
-              on NixOS 25.11+. If using an older NixOS version, you may need to:
-              
-              1. Upgrade to NixOS 25.11+
-              2. Set infrastructure.crowdsec.features.firewallBouncer = false
-              3. Provide the package from an external source
-            '';
-          }
-          {
-            assertion = !cfg.features.haproxyProtection || cfg.haproxy.package != null;
-            message = ''
-              CrowdSec HAProxy SPOA bouncer is enabled but no package is configured.
-              
-              The bouncer package should be available as pkgs.cs-haproxy-spoa-bouncer.
-              If the package is not available, you may need to:
-              
-              1. Set infrastructure.crowdsec.features.haproxyProtection = false
-              2. Provide the package from an external source
-            '';
-          }
           {
             assertion = acquisitions != [];
             message = ''
@@ -1356,61 +727,8 @@ in
         # Install useful CLI tools
         environment.systemPackages = [ 
           cfg.package  # Includes cscli
-        ] ++ lib.optionals (bouncerEnabled && cfg.bouncer.mode == "nftables") [
-          pkgs.nftables
-        ] ++ lib.optionals (bouncerEnabled && cfg.bouncer.mode == "iptables") [
-          pkgs.iptables
-        ] ++ lib.optionals (bouncerEnabled && cfg.bouncer.mode == "ipset") [
-          pkgs.ipset
         ];
       }
-
-      # ==========================================================================
-      # Declarative nftables Integration
-      # ==========================================================================
-      (lib.mkIf useNftablesIntegration {
-        networking.nftables.enable = true;
-        
-        networking.nftables.tables = {
-          # IPv4 CrowdSec table
-          crowdsec = {
-            family = "ip";
-            content = ''
-              set crowdsec-blocklist {
-                type ipv4_addr
-                flags timeout
-              }
-              
-              chain crowdsec-chain {
-                type filter hook input priority -1; policy accept;
-                ${lib.optionalString cfg.bouncer.denyLog ''
-                ip saddr @crowdsec-blocklist log prefix "${cfg.bouncer.denyLogPrefix}" 
-                ''}
-                ip saddr @crowdsec-blocklist ${lib.toLower cfg.bouncer.denyAction}
-              }
-            '';
-          };
-          
-          # IPv6 CrowdSec table
-          crowdsec6 = {
-            family = "ip6";
-            content = ''
-              set crowdsec6-blocklist {
-                type ipv6_addr
-                flags timeout
-              }
-              
-              chain crowdsec6-chain {
-                type filter hook input priority -1; policy accept;
-                ${lib.optionalString cfg.bouncer.denyLog ''
-                ip6 saddr @crowdsec6-blocklist log prefix "${cfg.bouncer.denyLogPrefix}" 
-                ''}
-                ip6 saddr @crowdsec6-blocklist ${lib.toLower cfg.bouncer.denyAction}
-              }
-            '';
-          };
-        };
-      })
 
       # ==========================================================================
       # Auditd Integration
@@ -1445,10 +763,6 @@ in
           "d ${stateDir}/hub 0755 crowdsec crowdsec - -"
           # Create /etc/crowdsec directory and symlink for cscli default config path
           "L+ /etc/crowdsec/config.yaml - - - - ${stateDir}/config/config.yaml"
-        ] ++ lib.optionals bouncerEnabled [
-          "d /var/lib/crowdsec-firewall-bouncer 0750 root root - -"
-        ] ++ lib.optionals haproxyBouncerEnabled [
-          "d /var/lib/crowdsec-haproxy-bouncer 0750 root root - -"
         ];
 
         # Main CrowdSec service
@@ -1480,69 +794,7 @@ in
             SupplementaryGroups = lib.optional (cfg.features.sshProtection || cfg.features.systemProtection) "systemd-journal";
           };
         };
-
-        # Firewall bouncer service (only when package is available)
-        # Note: The binary is named cs-firewall-bouncer (from the Go module name)
-        systemd.services.crowdsec-firewall-bouncer = lib.mkIf bouncerEnabled {
-          description = "CrowdSec Firewall Bouncer";
-          wantedBy = [ "multi-user.target" ];
-          after = [ "network.target" "crowdsec.service" ];
-          requires = [ "crowdsec.service" ];
-          
-          serviceConfig = {
-            Type = "simple";
-            ExecStartPre = "${bouncerRegisterScript}";
-            ExecStart = "${cfg.bouncer.package}/bin/cs-firewall-bouncer -c /var/lib/crowdsec-firewall-bouncer/config.yaml";
-            Restart = "always";
-            RestartSec = "10s";
-          };
-        };
-
-        # HAProxy SPOA bouncer service (only when package is available)
-        systemd.services.crowdsec-haproxy-bouncer = lib.mkIf haproxyBouncerEnabled {
-          description = "CrowdSec HAProxy SPOA Bouncer";
-          wantedBy = [ "multi-user.target" ];
-          after = [ "network.target" "crowdsec.service" ];
-          requires = [ "crowdsec.service" ];
-
-          serviceConfig = {
-            Type = "simple";
-            ExecStartPre = "${haproxyBouncerRegisterScript}";
-            ExecStart = "${cfg.haproxy.package}/bin/cs-haproxy-spoa-bouncer -c /var/lib/crowdsec-haproxy-bouncer/config.yaml";
-            Restart = "always";
-            RestartSec = "10s";
-          };
-        };
-
-        # Python bouncer registration service (oneshot - registers bouncer and stores API key)
-        systemd.services.crowdsec-python-bouncer = lib.mkIf pythonBouncerEnabled {
-          description = "CrowdSec Python Bouncer Registration";
-          wantedBy = [ "multi-user.target" ];
-          after = [ "network.target" "crowdsec.service" ];
-          requires = [ "crowdsec.service" ];
-
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
-            ExecStart = "${pythonBouncerRegisterScript}";
-          };
-        };
-
-        # Python CAPI credentials service (oneshot - generates CAPI credentials for signal sharing)
-        systemd.services.crowdsec-python-capi = lib.mkIf (pythonBouncerEnabled && cfg.python.enableCapi) {
-          description = "CrowdSec Python CAPI Credentials Generation";
-          wantedBy = [ "multi-user.target" ];
-          after = [ "network.target" "crowdsec.service" "crowdsec-python-bouncer.service" ];
-          requires = [ "crowdsec.service" ];
-
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
-            ExecStart = "${pythonCapiRegisterScript}";
-          };
-        };
       })
-
 
       # ==========================================================================
       # Native Implementation (NixOS 25.11+)
@@ -1553,10 +805,6 @@ in
           # WORKAROUND #445342: Create state directory
           # WORKAROUND #446764: Create online_api_credentials.yaml
           "f /var/lib/crowdsec/online_api_credentials.yaml 0640 crowdsec crowdsec - -"
-        ] ++ lib.optionals bouncerEnabled [
-          "d /var/lib/crowdsec-firewall-bouncer 0750 root root - -"
-        ] ++ lib.optionals haproxyBouncerEnabled [
-          "d /var/lib/crowdsec-haproxy-bouncer 0750 root root - -"
         ];
 
         services.crowdsec = {
@@ -1589,70 +837,7 @@ in
             cfg.extraSettings
           ];
         };
-
-        # Firewall bouncer service (custom - not yet in native nixpkgs)
-        # Note: The binary is named cs-firewall-bouncer (from the Go module name)
-        systemd.services.crowdsec-firewall-bouncer = lib.mkIf bouncerEnabled {
-          description = "CrowdSec Firewall Bouncer";
-          wantedBy = [ "multi-user.target" ];
-          after = [ "network.target" "crowdsec.service" ];
-          requires = [ "crowdsec.service" ];
-
-          path = [ pkgs.iptables pkgs.ipset ];
-          serviceConfig = {
-            Type = "simple";
-            ExecStartPre = "${bouncerRegisterScript}";
-            ExecStart = "${cfg.bouncer.package}/bin/cs-firewall-bouncer -c /var/lib/crowdsec-firewall-bouncer/config.yaml";
-            Restart = "always";
-            RestartSec = "10s";
-          };
-        };
-
-        # HAProxy SPOA bouncer service (custom - not yet in native nixpkgs)
-        systemd.services.crowdsec-haproxy-bouncer = lib.mkIf haproxyBouncerEnabled {
-          description = "CrowdSec HAProxy SPOA Bouncer";
-          wantedBy = [ "multi-user.target" ];
-          after = [ "network.target" "crowdsec.service" ];
-          requires = [ "crowdsec.service" ];
-
-          serviceConfig = {
-            Type = "simple";
-            ExecStartPre = "${haproxyBouncerRegisterScript}";
-            ExecStart = "${cfg.haproxy.package}/bin/cs-haproxy-spoa-bouncer -c /var/lib/crowdsec-haproxy-bouncer/config.yaml";
-            Restart = "always";
-            RestartSec = "10s";
-          };
-        };
-
-        # Python bouncer registration service (oneshot - registers bouncer and stores API key)
-        systemd.services.crowdsec-python-bouncer = lib.mkIf pythonBouncerEnabled {
-          description = "CrowdSec Python Bouncer Registration";
-          wantedBy = [ "multi-user.target" ];
-          after = [ "network.target" "crowdsec.service" ];
-          requires = [ "crowdsec.service" ];
-
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
-            ExecStart = "${pythonBouncerRegisterScript}";
-          };
-        };
-
-        # Python CAPI credentials service (oneshot - generates CAPI credentials for signal sharing)
-        systemd.services.crowdsec-python-capi = lib.mkIf (pythonBouncerEnabled && cfg.python.enableCapi) {
-          description = "CrowdSec Python CAPI Credentials Generation";
-          wantedBy = [ "multi-user.target" ];
-          after = [ "network.target" "crowdsec.service" "crowdsec-python-bouncer.service" ];
-          requires = [ "crowdsec.service" ];
-
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
-            ExecStart = "${pythonCapiRegisterScript}";
-          };
-        };
       })
     ]
   );
 }
-
